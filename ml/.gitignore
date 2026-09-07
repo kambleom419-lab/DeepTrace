@@ -1,0 +1,35 @@
+# ── Python / ML ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# ── ML artifacts ────────────────────────────────────────────
+ml/weights/
+ml/data/
+ml/runs/
+ml/scratch/
+*.pt
+*.pth
+*.onnx
+*.h5
+*.ckpt
+*.safetensors
+*.pb
+
+# ── Media / datasets (large) ────────────────────────────────
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.jpg
+*.jpeg
+*.png
+!*.example.*

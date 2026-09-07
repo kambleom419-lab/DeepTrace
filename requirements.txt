@@ -1,0 +1,12 @@
+# DeepTrace — root requirements
+#
+# The ML pipeline dependencies. Install with the CPU torch wheel on machines
+# without an NVIDIA GPU:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
+#
+# A backend/requirements.txt (FastAPI etc.) will be added in Phase 3 and can
+# simply `-r ../requirements.txt` if it needs the ML deps too.
+
+-r ml/requirements.txt
