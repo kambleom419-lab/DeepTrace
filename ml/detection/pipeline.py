@@ -70,6 +70,7 @@ class Analyzer:
         self.th_real = float(th.get("real", 0.4))
         self.th_susp = float(th.get("suspicious", 0.5))
         self.top_k = int(th.get("heatmap_top_k", 3))
+        self.t_hidden = int(self.cfg.get("temporal", {}).get("hidden", 128))
 
         # weight paths
         self.weights = WEIGHTS_DIR
@@ -103,13 +104,13 @@ class Analyzer:
 
         self.temporal = _load_head(self._temporal_ckpt, TemporalHead,
                                    in_dim=feat_dim,
-                                   hidden=int(self.cfg.get("temporal", {}).get("hidden", 128)))
+                                   hidden=self.t_hidden)
         self.frequency = _load_head(self._freq_ckpt, FrequencyHead,
                                     in_dim=256,
                                     hidden=int(self.cfg.get("frequency", {}).get("hidden", 64)))
-        # fusion input = spatial mean feat (feat_dim) + temporal hidden (128) + freq (256)
+        # fusion input = spatial mean feat (feat_dim) + temporal hidden (t_hidden) + freq (256)
         self.fusion = _load_head(self._fusion_ckpt, FusionHead,
-                                 in_dim=feat_dim + 128 + 256,
+                                 in_dim=feat_dim + self.t_hidden + 256,
                                  hidden=int(self.cfg.get("fusion", {}).get("hidden", 64)))
         self._models_ready = True
 
@@ -148,17 +149,26 @@ class Analyzer:
 
         # 3) temporal (features reused — no extra backbone pass)
         temporal_prob = _PRIORS["temporal"]
+        temporal_hidden = np.zeros(self.t_hidden, dtype=np.float32)
         if self.temporal is not None:
             with torch.no_grad():
                 temporal_prob = float(torch.sigmoid(self.temporal(feats.unsqueeze(0))).item())
-        temporal_hidden = np.zeros(128, dtype=np.float32)
+                # mean-pooled GRU hidden state — the exact temporal feature the fusion
+                # head was trained on in train.py::train_fusion. Must not be zeros:
+                # that would make inference disagree with training.
+                gru_out, _ = self.temporal.gru(feats.unsqueeze(0))
+                temporal_hidden = gru_out.mean(dim=1).squeeze(0).numpy()
 
         # 4) frequency
         fstats = freq_stats_for_batch(crops)  # (T,256)
         freq_prob = _PRIORS["frequency"]
         if self.frequency is not None:
             with torch.no_grad():
-                freq_prob = float(torch.sigmoid(self.frequency(torch.from_numpy(fstats))).item())
+                # unsqueeze -> (1,T,256) so FrequencyHead averages over the T crops
+                # (its (B,T,F) branch). A bare (T,256) is read as B=T and yields T
+                # scores instead of one video score.
+                freq_prob = float(torch.sigmoid(
+                    self.frequency(torch.from_numpy(fstats).unsqueeze(0))).item())
 
         # 5) fusion
         spatial_feat = feats.mean(dim=0).numpy()

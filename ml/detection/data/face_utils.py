@@ -52,12 +52,6 @@ def align_face(rgb: np.ndarray, kps: np.ndarray, size: int = 224) -> np.ndarray:
     kps: (5,2) float32 in the order insightface returns (right eye, left eye,
          nose, right mouth, left mouth).
     """
-    from skimage import transform  # deferred so we can swap if needed
-    import scipy as sp
-
-    # estimate similarity transform
-    tform = sp.spatial.transform.Rotation.identity()  # noqa: F841 (clarity)
-
     # Use cv2 estimateAffinePartial2D (similarity) on the 5-point pairs
     M, _ = cv2.estimateAffinePartial2D(kps.astype(np.float32), TEMPLATE, method=cv2.RANSAC)
     if M is None:

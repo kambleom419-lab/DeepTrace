@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# ml/  (parent of the detection/ package)
-ROOT = Path(__file__).resolve().parent.parent
+# ml/  (this file is ml/detection/config/paths.py, so the package root is 3 up)
+ROOT = Path(__file__).resolve().parents[2]
 
 WEIGHTS_DIR = ROOT / "weights"
 DATA_DIR = ROOT / "data"

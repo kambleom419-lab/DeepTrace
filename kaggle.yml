@@ -1,0 +1,10 @@
+project: deepfake-detection
+kernel_slug: kambleom/deepfake-detection
+code_file: ml\kaggle\deeptrace_kaggle_train.ipynb
+accelerator: none
+internet: false
+privacy: private
+datasets: []
+competitions: []
+outputs:
+  download_to: .kaggle-outputs/

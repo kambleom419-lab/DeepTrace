@@ -65,7 +65,7 @@ def train_spatial(cfg, dataset_root):
         tot = 0.0
         n = 0
         for img, label in tr_loader:
-            lbl = torch.tensor([[float(label)] for _ in range(img.size(0))])
+            lbl = label.float()
             _, logits = model.forward_with_feats(img)
             loss = lossf(logits, lbl)
             opt.zero_grad()
@@ -225,7 +225,9 @@ def train_frequency(cfg, dataset_root):
             stats = _stats(s)
             if stats is None:
                 continue
-            x = torch.from_numpy(np.asarray(stats)).float()
+            # (1,T,256): the head aggregates over the T crops into one video score.
+            # A bare (T,256) is read as B=T and returns T scores instead of one.
+            x = torch.from_numpy(np.asarray(stats)).float().unsqueeze(0)
             out = model(x)  # aggregates over T
             loss = lossf(out, torch.tensor([float(s.label)]))
             opt.zero_grad()
@@ -251,7 +253,7 @@ def _val_freq(model, stats_fn, val_samples):
         st = stats_fn(s)
         if st is None:
             continue
-        p = torch.sigmoid(model(torch.from_numpy(np.asarray(st)).float())).item()
+        p = torch.sigmoid(model(torch.from_numpy(np.asarray(st)).float().unsqueeze(0))).item()
         correct += int(p >= 0.5) == s.label
         total += 1
     return correct / max(total, 1)

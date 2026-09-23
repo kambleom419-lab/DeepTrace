@@ -1,0 +1,21 @@
+{
+  "id": "kambleom/deeptrace-crops",
+  "title": "deeptrace crops",
+  "code_file": "deeptrace_kaggle_train.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "machine_shape": "",
+  "dataset_sources": [
+    "xdxd003/ff-c23",
+    "reubensuju/celeb-df-v2"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [
+    "kambleom/deeptrace-index"
+  ],
+  "model_sources": []
+}

@@ -10,7 +10,7 @@ venv/
 .commandcode/
 
 # ── Local study/interview guides (not for the public repo) ───
-docs/
+
 
 # ── Build outputs ─────────────────────────────────────────────
 dist/

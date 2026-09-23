@@ -169,17 +169,22 @@ class SingleCropDataset:
 
 
 def default_transform(face_size: int = 224, train: bool = False):
-    """Light normalization/augmentation. No heavy aug on CPU."""
+    """Light normalization/augmentation. No heavy aug on CPU.
+
+    Augmentation runs AFTER ToTensor: the datasets feed numpy HWC crops, and
+    torchvision's flip/jitter ops require a tensor (they raise TypeError on a
+    numpy array). Order and parameters here match the Kaggle notebook so that
+    GPU-trained and CPU-trained weights stay interchangeable.
+    """
     from torchvision import transforms
 
-    ops = []
+    ops = [transforms.ToTensor()]
     if train:
         ops.append(transforms.RandomHorizontalFlip(p=0.5))
         ops.append(transforms.ColorJitter(brightness=0.1, contrast=0.1))
-    ops += [
-        transforms.ToTensor(),
+    ops.append(
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
+    )
     return transforms.Compose(ops)
 
 
