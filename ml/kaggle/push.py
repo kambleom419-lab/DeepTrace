@@ -26,7 +26,8 @@ HERE = Path(__file__).resolve().parent
 NOTEBOOK = HERE / "deeptrace_kaggle_train.ipynb"
 METADATA = HERE / "kernel-metadata.json"
 
-ORDER = ["index", "crops", "spatial", "temporal", "frequency", "fusion", "eval", "export"]
+ORDER = ["index", "bench", "crops", "spatial", "temporal", "frequency", "fusion",
+         "eval", "export"]
 PREFIX = "deeptrace"
 DEFAULT_DATASETS = ["xdxd003/ff-c23", "reubensuju/celeb-df-v2"]
 
@@ -41,6 +42,10 @@ def parse_args():
     ap.add_argument("--competition-sources", nargs="*", default=[],
                     help='e.g. deepfake-detection-challenge (accept its rules first)')
     ap.add_argument("--no-push", action="store_true", help="only write the files")
+    ap.add_argument("--no-gpu", action="store_true",
+                    help="set enable_gpu false. Use for 'crops': face detection is "
+                         "CPU-bound, so the GPU buys nothing and the CPU runtime is "
+                         "unmetered whereas GPU hours are capped.")
     return ap.parse_args()
 
 
@@ -65,12 +70,41 @@ def set_stage_in_notebook(stage: str) -> None:
     print("notebook  : STAGE = %r" % stage)
 
 
-def write_metadata(args) -> str:
-    kernel_id = "%s/%s-%s" % (args.owner, PREFIX, args.stage)
-    prev = None
+def kernel_id_for(owner: str, stage: str) -> str:
+    return "%s/%s-%s" % (owner, PREFIX, stage)
+
+
+def previous_kernel_id(args):
     idx = ORDER.index(args.stage)
-    if idx > 0:
-        prev = "%s/%s-%s" % (args.owner, PREFIX, ORDER[idx - 1])
+    return kernel_id_for(args.owner, ORDER[idx - 1]) if idx > 0 else None
+
+
+def previous_stage_ready(prev: str):
+    """Is the stage we chain onto actually finished?
+
+    'kaggle kernels push' mounts a source kernel's /kaggle/working only once that
+    version is COMMITTED. Push while the previous stage is still training and the
+    mount resolves to nothing: this stage then dies minutes later with "the earlier
+    stage's output was not mounted", which looks like a code bug but is purely a
+    race. Returns (ok, detail); ok is None when the state cannot be determined.
+    """
+    exe = shutil.which("kaggle")
+    if exe is None:
+        return None, "kaggle CLI not found"
+    r = subprocess.run([exe, "kernels", "status", prev],
+                       capture_output=True, text=True)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if "COMPLETE" in out:
+        return True, "COMPLETE"
+    for state in ("RUNNING", "QUEUED", "ERROR", "CANCEL"):
+        if state in out:
+            return False, state
+    return None, out or "unknown"
+
+
+def write_metadata(args) -> str:
+    kernel_id = kernel_id_for(args.owner, args.stage)
+    prev = previous_kernel_id(args)
 
     md = {
         "id": kernel_id,
@@ -79,7 +113,7 @@ def write_metadata(args) -> str:
         "language": "python",
         "kernel_type": "notebook",
         "is_private": True,
-        "enable_gpu": True,
+        "enable_gpu": not args.no_gpu,
         "enable_tpu": False,
         "enable_internet": True,
         "machine_shape": "",
@@ -97,6 +131,21 @@ def main():
     args = parse_args()
     if not NOTEBOOK.exists():
         sys.exit("not found: %s" % NOTEBOOK)
+
+    prev = previous_kernel_id(args)
+    if prev and not args.no_push:
+        ok, state = previous_stage_ready(prev)
+        print("preflight : %s -> %s" % (prev, state))
+        if ok is False:
+            sys.exit(
+                "\nRefusing to push: %s is %s, not COMPLETE.\n"
+                "Kaggle mounts a source kernel's /kaggle/working only after that\n"
+                "version is committed. Pushing now mounts an EMPTY /kaggle/input and\n"
+                "this stage fails minutes later with 'the earlier stage's output was\n"
+                "not mounted'.\n"
+                "Wait for it to finish, then re-run this command." % (prev, state))
+        if ok is None:
+            print("          (state unknown - continuing anyway)")
 
     set_stage_in_notebook(args.stage)
     kernel_id = write_metadata(args)

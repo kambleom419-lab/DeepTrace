@@ -53,9 +53,10 @@ python push.py index
 Run the stages one at a time to inspect each result:
 
 ```
-python push.py index       # -> manifest.csv                (fast)
-python push.py crops       # -> crops/ + fstats/            (slow, hours)
-python push.py spatial     # -> weights/spatial_xception.pt (GPU, long pole)
+python push.py index       # -> manifest.csv                 (fast)
+python push.py bench       # -> how many concurrent face detectors this box wants
+python push.py crops       # -> crops/ + fstats/             (slow)
+python push.py spatial     # -> weights/spatial_xception.pt  (GPU, long pole)
 python push.py temporal    # -> weights/temporal_gru.pt
 python push.py frequency   # -> weights/frequency_mlp.pt
 python push.py fusion      # -> weights/fusion_mlp.pt
@@ -88,6 +89,54 @@ python push.py temporal    # (edit STAGE to "temporal,frequency,fusion" by hand)
 
 or just run `python push.py <stage>` then change `STAGE` to a comma-separated list in
 cell 2 and push again.
+
+### `crops` speed — which device, and the two knobs
+
+Face detection runs on **ONNX Runtime, not PyTorch**. That distinction used to cost us the
+GPU: the Kaggle image ships a custom `onnxruntime` build (it advertises an
+`AzureExecutionProvider`, which no PyPI wheel has) and it shadows anything pip installs
+into `site-packages`, because both distributions own the same module name.
+
+Cell 3 now installs the GPU build into a private directory and puts it **first** on
+`sys.path`, which out-ranks the image's copy:
+
+```
+onnxruntime 1.30.0 ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+loaded from /tmp/ort_gpu/onnxruntime/__init__.py
+```
+
+When that succeeds, cell 3 overrides the two box settings for the GPU path and prints
+that it did. When it fails, it says so and you should run `crops` with `--no-gpu` so the
+stage costs no GPU quota.
+
+The two knobs (cell 2) are the **CPU-only** defaults:
+
+| Setting | CPU default | GPU default | Meaning |
+|---|---|---|---|
+| `ORT_INTRA_THREADS` | `1` | `0` (ORT's) | threads per ONNX Runtime session |
+| `N_WORKERS` | cores | `2` | concurrent videos detected in parallel |
+
+On CPU, ORT's default of one intra-op thread per core is *slower per frame* than a single
+thread — sync overhead dominates for this model. Measured over 6 videos: 1 session on all
+cores 87.6 s vs 1 session on one thread 39.9 s. Hence one thread per session, one session
+per core. On GPU that logic inverts: kernels serialise on one T4 anyway, and
+`intra_op=1` would only slow the CPU-side ops down.
+
+`push.py bench` measures real end-to-end throughput for a few combinations on the machine
+you actually got, choosing the right axis for the device, and prints which to use. Trust
+it over these defaults if it disagrees.
+
+Parallelism is over **threads, not processes** — ONNX Runtime releases the GIL inside
+`Run()`, so concurrent sessions genuinely overlap, and one shared model is used instead
+of one per worker. `FaceAnalysis.get()` is safe to call concurrently (its only mutable
+state is a read-through anchor cache keyed by output shape).
+
+Verified: 4 workers produce **byte-identical** crops to the sequential path, and
+`ORT_INTRA_THREADS` 1 vs all-cores produces byte-identical crops too — so neither knob
+changes the training data, only the speed.
+
+`build_notebook.py` regenerates this notebook from readable cell sources. Edit that
+file, not the `.ipynb`.
 
 ### Continuing between pushes
 

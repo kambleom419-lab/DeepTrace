@@ -1,6 +1,6 @@
 {
-  "id": "kambleom/deeptrace-crops",
-  "title": "deeptrace crops",
+  "id": "kambleom/deeptrace-fusion",
+  "title": "deeptrace fusion",
   "code_file": "deeptrace_kaggle_train.ipynb",
   "language": "python",
   "kernel_type": "notebook",
@@ -15,7 +15,7 @@
   ],
   "competition_sources": [],
   "kernel_sources": [
-    "kambleom/deeptrace-index"
+    "kambleom/deeptrace-frequency"
   ],
   "model_sources": []
 }
