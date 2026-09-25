@@ -1,6 +1,6 @@
 {
-  "id": "kambleom/deeptrace-fusion",
-  "title": "deeptrace fusion",
+  "id": "kambleom/deeptrace-frequency",
+  "title": "deeptrace frequency",
   "code_file": "deeptrace_kaggle_train.ipynb",
   "language": "python",
   "kernel_type": "notebook",
@@ -15,7 +15,7 @@
   ],
   "competition_sources": [],
   "kernel_sources": [
-    "kambleom/deeptrace-frequency"
+    "kambleom/deeptrace-temporal"
   ],
   "model_sources": []
 }

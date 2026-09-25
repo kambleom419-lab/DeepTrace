@@ -160,11 +160,29 @@ CROP_FORMAT = "png"
 MAX_VIDEOS_PER_METHOD = 400
 MAX_REAL_VIDEOS       = 1000
 
+# Which datasets a HEAD is allowed to train on. This is ENFORCED by train_rows() below,
+# not decorative: without it a head sees the eval datasets' training pixels too, and
+# "cross-dataset" silently becomes in-domain. That is why the old celeb-df numbers came
+# out HIGHER than ff-c23 - a held-out dataset cannot beat the training distribution.
 TRAIN_DATASETS = ["ff-c23"]
 EVAL_DATASETS  = ["celeb-df-v2", "dfdc"]
 
 # grouped (identity-aware) split fractions per dataset
 SPLIT = dict(train=0.70, val=0.10, holdout=0.10, test=0.10)
+
+
+def train_rows(df, split):
+    # The ONLY rows a head may train or validate on: this split AND a train dataset.
+    # Two independent leaks are closed at once:
+    #   (a) eval datasets are excluded, so held-out numbers are genuinely cross-dataset;
+    #   (b) validation is in-domain, so checkpoint selection is not tuned on eval data.
+    return df[(df["split"] == split) & df["dataset"].isin(TRAIN_DATASETS)]
+
+
+# Recompute fstats/ from crops/ at the top of 'frequency'. Flip True after changing
+# freq_stats_for_crop(): crops are lossless PNG, so this reproduces them exactly and
+# saves a 5.5 h 'crops' re-run.
+REGEN_FSTATS = False
 
 BACKBONE = "xception"
 
@@ -191,7 +209,18 @@ for _d in (WEIGHTS_DIR, CROPS_DIR, FSTATS_DIR, FEATCACHE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 random.seed(SEED)
-print("torch cuda available:", __import__("torch").cuda.is_available())
+# Seeding 'random' alone is not reproducibility. The training loops use torch RNG
+# (shuffles, dropout, weight init), and DataLoader/WeightedRandomSampler use torch too,
+# so without these two pushes of the same STAGE do not reproduce - which makes any
+# "this fix helped" comparison unfalsifiable.
+import numpy as np
+import torch
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+np.random.seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+print("torch cuda available:", torch.cuda.is_available())
 print("work dir:", WORK)
 """
 
@@ -649,6 +678,17 @@ class FrequencyHead(nn.Module):
     def __init__(self, in_dim, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
+            # Per-feature normalization goes FIRST. The DCT stats span a huge range:
+            # low_energy ~0.93 (DC-dominated, ~no signal) vs high_energy ~0.008 (the real
+            # artifact signal). With a bare Linear, high_energy contributes ~0.0005 to each
+            # pre-activation and gets no usable gradient, so the MLP collapses to a constant
+            # - which is what frequency_mlp.pt did (val_acc == the majority rate exactly).
+            # BN puts every feature at unit scale and keeps the signal. It REQUIRES a batch
+            # larger than 1: PyTorch raises "Expected more than 1 value per channel when
+            # training" for a batch of 1, because per-sample variance is 0. The old
+            # per-video loop fed exactly that, so BN without batching does not degrade -
+            # it crashes the stage. do_frequency therefore feeds real mini-batches.
+            nn.BatchNorm1d(in_dim),
             nn.Linear(in_dim, hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
@@ -667,6 +707,10 @@ class FusionHead(nn.Module):
     def __init__(self, in_dim, hidden=64, dropout=0.3):
         super().__init__()
         self.net = nn.Sequential(
+            # Same per-feature scaling problem as FrequencyHead: the input concatenates
+            # 2048 backbone features + 128 GRU + 256 DCT stats, whose magnitudes differ by
+            # orders. BN first, then the MLP. Needs batches > 1 (see do_fusion).
+            nn.BatchNorm1d(in_dim),
             nn.Dropout(dropout),
             nn.Linear(in_dim, hidden),
             nn.ReLU(inplace=True),
@@ -1233,8 +1277,9 @@ def eval_spatial(model, loader, dev):
 def do_spatial():
     require(CROP_INDEX_CSV, "produced by the 'crops' stage")
     idx = load_crop_index()
-    tr = idx[idx["split"].isin(["train"])]
-    va = idx[idx["split"] == "val"]
+    # ff-c23 only: a head must never train on an eval dataset's pixels (see train_rows).
+    tr = train_rows(idx, "train")
+    va = train_rows(idx, "val")
     if len(tr) == 0:
         raise SystemExit("no training videos - run the 'crops' stage first")
 
@@ -1304,6 +1349,24 @@ cell_temporal = r"""# ==========================================================
 # =============================================================
 FEAT_DIM = {"xception": 2048, "convnext_tiny": 768}
 
+import hashlib
+
+
+def _spatial_tag():
+    # Short digest of the spatial checkpoint, used to VERSION the feature cache.
+    # Cached backbone features are only valid for the backbone that produced them.
+    # Without this, retraining 'spatial' leaves the restored feat_cache/ in place
+    # (COPY_PRIOR_ARTIFACTS faithfully copies it forward) and 'temporal' silently
+    # trains on features from the OLD backbone.
+    p = WEIGHTS_DIR / "spatial_xception.pt"
+    return hashlib.sha1(p.read_bytes()).hexdigest()[:10] if p.exists() else "untrained"
+
+
+def feat_cache_dir():
+    d = FEATCACHE_DIR / _spatial_tag()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 
 def load_detector(trainable=False):
     dev = device()
@@ -1321,7 +1384,7 @@ def load_detector(trainable=False):
 
 @torch.no_grad()
 def cache_features(video_id, model, dev):
-    cpath = FEATCACHE_DIR / (video_id + ".pt")
+    cpath = feat_cache_dir() / (video_id + ".pt")
     if cpath.exists():
         return torch.load(cpath, map_location="cpu")
     files = crop_files(video_id)
@@ -1359,8 +1422,8 @@ def do_temporal():
                        layers=TEMPORAL_CFG["layers"], dropout=TEMPORAL_CFG["dropout"]).to(dev)
     opt = torch.optim.AdamW(gru.parameters(), lr=TEMPORAL_CFG["lr"], weight_decay=5e-4)
     lossf = nn.BCEWithLogitsLoss()
-    tr_rows = idx[idx["split"] == "train"].to_dict("records")
-    va_rows = idx[idx["split"] == "val"].to_dict("records")
+    tr_rows = train_rows(idx, "train").to_dict("records")
+    va_rows = train_rows(idx, "val").to_dict("records")
     rng = random.Random(SEED)
 
     best = 0.0
@@ -1404,61 +1467,96 @@ cell_frequency = r"""# =========================================================
 # Trains the MLP on the precomputed DCT stats (fstats/*.npy).
 # The head averages over T internally, matching pipeline.py.
 # =============================================================
+from sklearn.metrics import roc_auc_score
+
+
 def do_frequency():
     require(CROP_INDEX_CSV, "produced by the 'crops' stage")
     idx = load_crop_index()
     dev = device()
 
-    def stats(vid):
-        p = FSTATS_DIR / (vid + ".npy")
-        if not p.exists():
-            return None
-        return torch.from_numpy(np.load(p)).float().to(dev)
+    if REGEN_FSTATS:
+        # crops/ are lossless PNG written from the same arrays the DCT saw, so the stats
+        # can be rebuilt here instead of re-running the 5.5 h 'crops' stage.
+        n = 0
+        for _, r in idx.iterrows():
+            paths = crop_files(r["video_id"])
+            if not paths:
+                continue
+            np.save(FSTATS_DIR / (r["video_id"] + ".npy"),
+                    freq_stats_for_batch([read_crop(p) for p in paths]))
+            n += 1
+        print("recomputed fstats for", n, "videos from", CROPS_DIR)
+
+    def per_video_matrix(rows):
+        # Preload one (256,) vector per video. The head averages over T internally, so
+        # average up front and feed (B, F) - that is what makes a real batch, and a real
+        # batch is what BatchNorm needs. The whole set is only a few MB of floats.
+        xs, ys = [], []
+        for r in rows:
+            p = FSTATS_DIR / (r["video_id"] + ".npy")
+            if not p.exists():
+                continue
+            s = torch.from_numpy(np.load(p)).float()          # (T, 256)
+            xs.append(s.mean(dim=0))
+            ys.append(float(r["label"]))
+        if not xs:
+            return None, None
+        return torch.stack(xs).to(dev), torch.tensor(ys, device=dev)
+
+    Xtr, ytr = per_video_matrix(train_rows(idx, "train").to_dict("records"))
+    Xva, yva = per_video_matrix(train_rows(idx, "val").to_dict("records"))
+    if Xtr is None or Xva is None:
+        raise SystemExit("no fstats - run 'crops' first, or set REGEN_FSTATS = True")
+    print("frequency: train=%d val=%d pos_rate=%.3f | ff-c23 only"
+          % (len(Xtr), len(Xva), float(ytr.mean())))
 
     model = FrequencyHead(in_dim=256, hidden=FREQUENCY_CFG["hidden"]).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=FREQUENCY_CFG["lr"], weight_decay=5e-4)
     lossf = nn.BCEWithLogitsLoss()
-    tr_rows = idx[idx["split"] == "train"].to_dict("records")
-    va_rows = idx[idx["split"] == "val"].to_dict("records")
-    rng = random.Random(SEED)
 
-    best = 0.0
+    def val_auc():
+        model.eval()                    # BN switches to its running statistics here
+        with torch.no_grad():
+            logits = torch.cat([model(Xva[i:i + 256]) for i in range(0, len(Xva), 256)])
+        return roc_auc_score(yva.cpu().numpy(), logits.cpu().numpy())
+
+    bs = FREQUENCY_CFG["batch"]
+    best, best_state, patience = -1.0, None, 0
     for ep in range(FREQUENCY_CFG["epochs"]):
         model.train()
-        rng.shuffle(tr_rows)
+        perm = torch.randperm(len(Xtr), device=dev)
         tot = n = 0
-        for r in tr_rows:
-            s = stats(r["video_id"])
-            if s is None:
+        for i in range(0, len(Xtr), bs):
+            j = perm[i:i + bs]
+            if len(j) < 2:              # BN raises on a batch of 1 - drop the tail
                 continue
-            # s is (T,256); unsqueeze -> (1,T,256) so the head averages over the T
-            # crops into one video score (its (B,T,F) branch). A bare (T,256) is read
-            # as B=T and returns T scores - which crashes .item() at inference.
-            loss = lossf(model(s.unsqueeze(0)), torch.tensor([float(r["label"])], device=dev))
+            loss = lossf(model(Xtr[j]), ytr[j])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             tot += loss.item()
             n += 1
-
-        model.eval()
-        correct = total = 0
-        with torch.no_grad():
-            for r in va_rows:
-                s = stats(r["video_id"])
-                if s is None:
-                    continue
-                p = torch.sigmoid(model(s.unsqueeze(0))).item()
-                correct += int(p >= 0.5) == int(r["label"])
-                total += 1
-        acc = correct / max(total, 1)
-        print("epoch %d/%d  loss=%.4f  val_acc=%.4f" % (ep + 1, FREQUENCY_CFG["epochs"],
-                                                        tot / max(n, 1), acc))
-        if acc >= best:
-            best = acc
-            torch.save({"state_dict": model.state_dict(), "config": FREQUENCY_CFG},
-                       WEIGHTS_DIR / "frequency_mlp.pt")
-    print("best val_acc:", round(best, 4))
+        auc = val_auc()
+        print("epoch %d/%d  loss=%.4f  val_auc=%.4f" % (ep + 1, FREQUENCY_CFG["epochs"],
+                                                        tot / max(n, 1), auc))
+        # Select on AUC, never ACC: on an imbalanced split ACC rewards the constant
+        # all-fake predictor that the dead branch already was (0.6781 == majority rate).
+        if auc > best:
+            best, patience = auc, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            patience += 1
+            if patience >= 8:
+                print("early stop: no val_auc gain for %d epochs" % patience)
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    torch.save({"state_dict": model.state_dict(), "config": FREQUENCY_CFG},
+               WEIGHTS_DIR / "frequency_mlp.pt")
+    print("best val_auc:", round(best, 4))
+    std = float(torch.sigmoid(model(Xva)).std()) if len(Xva) else 0.0
+    print("val prob std: %.5f  (near 0 => still a constant predictor)" % std)
 """
 
 cell_fusion = r"""# =============================================================
@@ -1470,6 +1568,9 @@ cell_fusion = r"""# ============================================================
 # Input vector (must match pipeline.py):
 #   [ mean(backbone feats) (2048) | mean(GRU hidden) (128) | mean(dct stats) (256) ]
 # =============================================================
+from sklearn.metrics import roc_auc_score as _auc
+
+
 def do_fusion():
     require(CROP_INDEX_CSV, "produced by the 'crops' stage")
     idx = load_crop_index()
@@ -1500,54 +1601,100 @@ def do_fusion():
         freq_v = np.load(sp).mean(axis=0)
         return np.concatenate([spatial_v, temporal_v, freq_v]).astype(np.float32)
 
+    # ---- honest validation split -------------------------------------------------
+    # Two fixes over the old code, both required for the number to be reportable:
+    #  (1) ff-c23 holdout only. train_rows() keeps eval datasets out, so fusion is not
+    #      tuned on the pixels it is later scored on.
+    #  (2) train/val carved BY IDENTITY. The old code validated on 'test' and saved the
+    #      best epoch on it, so every fusion number was an optimistic bound.
+    ho = train_rows(idx, "holdout").copy()
+    if ho.empty:
+        raise SystemExit("no holdout rows for %s - re-run the 'index' stage" % TRAIN_DATASETS)
+
+    def _grp(vid):
+        # video_id is "<dataset>__<method>__<stem>"; source_id() folds a clip and its
+        # manipulated twin together (000_003 -> 000) so the pair cannot straddle the split.
+        parts = vid.split("__", 2)
+        return parts[0] + ":" + source_id(parts[-1])
+
+    ho["grp"] = [_grp(v) for v in ho["video_id"]]
+    groups = sorted(ho["grp"].unique())
+    rng = random.Random(SEED)
+    rng.shuffle(groups)
+    val_groups = set(groups[int(len(groups) * 0.7):])
+    is_val = ho["grp"].isin(val_groups).to_numpy()
+
+    tr_rows = ho[~is_val].to_dict("records")
+    va_rows = ho[is_val].to_dict("records")
+    print("fusion: train=%d val=%d (%d/%d identity groups) | 'test' stays untouched"
+          % (len(tr_rows), len(va_rows), len(val_groups), len(groups)))
+    if not tr_rows or not va_rows:
+        raise SystemExit("holdout too small to split by identity (%d groups)" % len(groups))
+
+    def feature_matrix(rows):
+        xs, ys = [], []
+        for r in rows:
+            v = fused_vec(r["video_id"])
+            if v is None:
+                continue
+            xs.append(torch.from_numpy(v))
+            ys.append(float(r["label"]))
+        if not xs:
+            return None, None
+        return torch.stack(xs).to(dev), torch.tensor(ys, device=dev)
+
+    Xtr, ytr = feature_matrix(tr_rows)
+    Xva, yva = feature_matrix(va_rows)
+    if Xtr is None or Xva is None:
+        raise SystemExit("could not build fusion features - check crops/fstats/feat_cache")
+    if yva.unique().numel() < 2:
+        raise SystemExit("fusion val split collapsed to one class - re-run 'index'")
+    print("fusion vectors: train=%d val=%d dim=%d" % (len(Xtr), len(Xva), Xtr.shape[1]))
+
     in_dim = FEAT_DIM[BACKBONE] + TEMPORAL_CFG["hidden"] + 256
     fusion = FusionHead(in_dim=in_dim, hidden=FUSION_CFG["hidden"],
                         dropout=FUSION_CFG["dropout"]).to(dev)
     opt = torch.optim.AdamW(fusion.parameters(), lr=FUSION_CFG["lr"], weight_decay=5e-4)
     lossf = nn.BCEWithLogitsLoss()
 
-    tr_rows = idx[idx["split"] == "holdout"].to_dict("records")
-    te_rows = idx[idx["split"] == "test"].to_dict("records")
-    print("fusion train (holdout):", len(tr_rows), "| fusion val (test):", len(te_rows))
-    if not tr_rows:
-        raise SystemExit("no holdout rows - re-run the 'index' stage")
+    def val_auc():
+        fusion.eval()                   # BN switches to its running statistics here
+        with torch.no_grad():
+            logits = torch.cat([fusion(Xva[i:i + 256]) for i in range(0, len(Xva), 256)])
+        return _auc(yva.cpu().numpy(), logits.cpu().numpy())
 
-    rng = random.Random(SEED)
-    best = 0.0
+    bs = FUSION_CFG["batch"]
+    best, best_state, patience = -1.0, None, 0
     for ep in range(FUSION_CFG["epochs"]):
         fusion.train()
-        rng.shuffle(tr_rows)
+        perm = torch.randperm(len(Xtr), device=dev)
         tot = n = 0
-        for r in tr_rows:
-            v = fused_vec(r["video_id"])
-            if v is None:
+        for i in range(0, len(Xtr), bs):
+            j = perm[i:i + bs]
+            if len(j) < 2:              # BN raises on a batch of 1 - drop the tail
                 continue
-            out = fusion(torch.from_numpy(v).unsqueeze(0).to(dev))
-            loss = lossf(out, torch.tensor([float(r["label"])], device=dev))
+            loss = lossf(fusion(Xtr[j]), ytr[j])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             tot += loss.item()
             n += 1
-
-        fusion.eval()
-        correct = total = 0
-        with torch.no_grad():
-            for r in te_rows:
-                v = fused_vec(r["video_id"])
-                if v is None:
-                    continue
-                p = torch.sigmoid(fusion(torch.from_numpy(v).unsqueeze(0).to(dev))).item()
-                correct += int(p >= 0.5) == int(r["label"])
-                total += 1
-        acc = correct / max(total, 1)
-        print("epoch %d/%d  loss=%.4f  val_acc=%.4f" % (ep + 1, FUSION_CFG["epochs"],
-                                                        tot / max(n, 1), acc))
-        if acc >= best:
-            best = acc
-            torch.save({"state_dict": fusion.state_dict(), "config": FUSION_CFG},
-                       WEIGHTS_DIR / "fusion_mlp.pt")
-    print("best val_acc:", round(best, 4))
+        auc = val_auc()
+        print("epoch %d/%d  loss=%.4f  val_auc=%.4f" % (ep + 1, FUSION_CFG["epochs"],
+                                                        tot / max(n, 1), auc))
+        if auc > best:
+            best, patience = auc, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in fusion.state_dict().items()}
+        else:
+            patience += 1
+            if patience >= 8:
+                print("early stop: no val_auc gain for %d epochs" % patience)
+                break
+    if best_state is not None:
+        fusion.load_state_dict(best_state)
+    torch.save({"state_dict": fusion.state_dict(), "config": FUSION_CFG},
+               WEIGHTS_DIR / "fusion_mlp.pt")
+    print("best val_auc:", round(best, 4))
 """
 
 cell_eval = r"""# =============================================================
@@ -1632,6 +1779,14 @@ def metrics(rows, branch):
 def do_eval():
     require(CROP_INDEX_CSV, "produced by the 'crops' stage")
     idx = load_crop_index()
+    # A missing eval dataset used to be invisible - the section is simply absent from
+    # eval.md and nothing says so. Make it loud: the cross-dataset number is the point.
+    for ds in EVAL_DATASETS:
+        if int((idx["dataset"] == ds).sum()) == 0:
+            print("WARNING: EVAL_DATASET %r has 0 videos in crop_index.csv - its section "
+                  "will be missing from eval.md (was it mounted at 'crops' time?)" % ds)
+    print("eval: %d test videos | datasets present: %s"
+          % (int((idx["split"] == "test").sum()), sorted(idx["dataset"].unique())))
     heads, dev = load_all_heads()
     branches = [b for b in ("spatial", "temporal", "frequency", "fusion") if heads.get(b) is not None or b == "spatial"]
 
@@ -1662,14 +1817,26 @@ def do_eval():
                 m = metrics(sub, b) if all(b in r for r in sub) else None
                 if m:
                     lines.append("| %s | %.4f | %.4f | %.4f | %d |" % (b, m["acc"], m["auc"], m["ap"], m["n"]))
-            lines.append("")
-            lines.append("| manipulation | n | fusion AUC |")
-            lines.append("|---|---|---|")
+            # Per-manipulation AUC is only defined where a method holds BOTH classes.
+            # ff-c23's fake methods are all-fake and celeb-df's real method is all-real,
+            # so this table was always empty - print a reason, not a header with no rows.
+            per_meth = []
             for meth in sorted({r["method"] for r in sub}):
                 msub = [r for r in sub if r["method"] == meth]
-                m = metrics(msub, "fusion") if ("fusion" in msub[0]) else None
+                if "fusion" not in msub[0]:
+                    continue
+                m = metrics(msub, "fusion")
                 if m:
-                    lines.append("| %s | %d | %.4f |" % (meth, m["n"], m["auc"]))
+                    per_meth.append((meth, m["n"], m["auc"]))
+            lines.append("")
+            if per_meth:
+                lines.append("| manipulation | n | fusion AUC |")
+                lines.append("|---|---|---|")
+                for meth, n_m, auc in per_meth:
+                    lines.append("| %s | %d | %.4f |" % (meth, n_m, auc))
+            else:
+                lines.append("_per-manipulation AUC omitted: every method in this dataset "
+                             "is single-class, so it is not defined._")
     report = "\n".join(lines)
     (WORK / "eval.md").write_text(report, encoding="utf-8")
     print(report)

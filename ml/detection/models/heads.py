@@ -57,6 +57,11 @@ class FrequencyHead(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
+            # Per-feature normalization first: the DCT stats range from ~0.93 (low_energy,
+            # DC-dominated) to ~0.008 (high_energy, the actual signal). Without this the
+            # informative features are ~100x too small to train and the MLP goes constant.
+            # Needs batch > 1 - see do_frequency / the Kaggle notebook.
+            nn.BatchNorm1d(in_dim),
             nn.Linear(in_dim, hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
@@ -78,6 +83,9 @@ class FusionHead(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 64, dropout: float = 0.3):
         super().__init__()
         self.net = nn.Sequential(
+            # The input concatenates 2048 backbone + 128 GRU + 256 DCT features whose
+            # magnitudes differ by orders - normalize per feature before the MLP.
+            nn.BatchNorm1d(in_dim),
             nn.Dropout(dropout),
             nn.Linear(in_dim, hidden),
             nn.ReLU(inplace=True),
