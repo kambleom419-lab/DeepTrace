@@ -1,0 +1,21 @@
+# DeepTrace backend — API + worker.
+# Installed alongside ml/requirements.txt in the container image.
+#   pip install -r backend/requirements.txt -r ml/requirements.txt
+
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12
+sqlalchemy>=2.0
+psycopg[binary]>=3.2
+pydantic>=2.9
+pydantic-settings>=2.6
+PyJWT>=2.9
+bcrypt>=4.2
+
+# Cloud services (used from phase 3 onward; harmless locally)
+azure-storage-blob>=12.23
+azure-storage-queue>=12.12
+
+# Tests
+pytest>=8.3
+httpx>=0.27

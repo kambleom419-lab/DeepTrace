@@ -70,6 +70,11 @@ ml/scratch/
 *.pb
 !ml/data/.gitkeep
 
+# ── Backend runtime state ────────────────────────────────────
+*.db
+*.sqlite3
+backend/_storage/
+
 # ── Media / dataset samples (large) ──────────────────────────
 *.mp4
 *.mov

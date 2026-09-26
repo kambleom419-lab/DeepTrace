@@ -13,6 +13,7 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -115,7 +116,18 @@ class Analyzer:
         self._models_ready = True
 
     # ── the pipeline ────────────────────────────────────────
-    def analyze(self, video_path: str | Path, out_dir: str | Path | None = None) -> dict:
+    def analyze(
+        self,
+        video_path: str | Path,
+        out_dir: str | Path | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> dict:
+        # on_stage reports the REAL pipeline boundaries so a caller (the backend worker)
+        # can persist genuine progress. Optional: passing nothing changes no behaviour.
+        def _stage(name: str) -> None:
+            if on_stage is not None:
+                on_stage(name)
+
         t0 = time.time()
         self._load_models()
         out_dir = Path(out_dir or (SCRATCH_DIR / "results"))
@@ -125,6 +137,7 @@ class Analyzer:
         meta = probe_ffprobe(video_path)
         tss = sample_timestamps(meta, self.frame_budget)
         frames = extract_frames_at_timestamps(video_path, tss, out_dir / "frames")
+        _stage("frames")
 
         crops: list[np.ndarray] = []
         frame_map: list[dict] = []
@@ -136,6 +149,7 @@ class Analyzer:
                 frame_map.append({"timestamp": fr["timestamp"], "frame_number": fr["frame_number"]})
         if not crops:
             raise RuntimeError(f"No face detected in any sampled frame of {video_path}")
+        _stage("faces")
 
         # 2) spatial (single backbone pass over all crops)
         to_t = T.Compose([
@@ -146,6 +160,7 @@ class Analyzer:
         with torch.no_grad():
             feats, sp_logits = self.detector.forward_with_feats(x)  # (T,D),(T,)
         sp_probs = torch.sigmoid(sp_logits).numpy()
+        _stage("spatial")
 
         # 3) temporal (features reused — no extra backbone pass)
         temporal_prob = _PRIORS["temporal"]
@@ -158,6 +173,7 @@ class Analyzer:
                 # that would make inference disagree with training.
                 gru_out, _ = self.temporal.gru(feats.unsqueeze(0))
                 temporal_hidden = gru_out.mean(dim=1).squeeze(0).numpy()
+        _stage("temporal")
 
         # 4) frequency
         fstats = freq_stats_for_batch(crops)  # (T,256)
@@ -169,6 +185,7 @@ class Analyzer:
                 # scores instead of one video score.
                 freq_prob = float(torch.sigmoid(
                     self.frequency(torch.from_numpy(fstats).unsqueeze(0))).item())
+        _stage("frequency")
 
         # 5) fusion
         spatial_feat = feats.mean(dim=0).numpy()
@@ -177,6 +194,7 @@ class Analyzer:
         if self.fusion is not None:
             with torch.no_grad():
                 fusion_prob = float(torch.sigmoid(self.fusion(torch.from_numpy(fused_vec).float())).item())
+        _stage("fusion")
 
         spatial_prob = float(sp_mean(sp_probs))
         if self.fusion is not None:
