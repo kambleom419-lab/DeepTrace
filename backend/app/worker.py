@@ -20,6 +20,7 @@ import time
 from app.config import get_settings
 from app.db import SessionLocal, init_db
 from app.jobs import run_analysis_job
+from app.logsetup import setup_logging
 from app.queue import get_transport
 
 logger = logging.getLogger(__name__)
@@ -105,9 +106,7 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="drain the queue and exit")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
-    )
+    setup_logging()
     worker_id = get_settings().resolved_worker_id
 
     if args.once:

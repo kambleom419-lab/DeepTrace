@@ -14,9 +14,9 @@ from app import mlbridge, queue, worker
 from app.api import auth, investigations
 from app.config import REPO_ROOT, get_settings
 from app.db import get_db, init_db
+from app.logsetup import setup_logging
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+setup_logging()
 logger = logging.getLogger("deeptrace")
 
 settings = get_settings()
