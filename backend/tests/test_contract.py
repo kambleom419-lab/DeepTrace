@@ -139,10 +139,11 @@ def test_progress_stage_is_always_a_known_stage(client, auth, sample_video):
     assert 0 <= body["progress"]["pct"] <= 100
 
 
-def test_completed_result_matches_the_typescript_interface(client, auth, sample_video):
+def test_completed_result_matches_the_typescript_interface(client, auth, sample_video,
+                                                           wait_for_terminal):
     inv_id = client.post("/api/investigations", files=sample_video,
                          headers=auth).json()["id"]
-    body = client.get(f"/api/investigations/{inv_id}", headers=auth).json()
+    body = wait_for_terminal(inv_id, auth)
 
     assert body["status"] == "completed"
     assert "completed_at" in body

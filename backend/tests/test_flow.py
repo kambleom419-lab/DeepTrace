@@ -1,25 +1,24 @@
-"""End-to-end flow: upload -> queued -> processed -> completed -> evidence served."""
+"""End-to-end flow: upload -> queued -> worker claims it -> completed -> evidence served."""
 from __future__ import annotations
 
 import time
 
-
-def _wait_for_terminal(client, auth, inv_id: str, timeout: float = 15.0) -> dict:
-    deadline = time.time() + timeout
-    body: dict = {}
-    while time.time() < deadline:
-        body = client.get(f"/api/investigations/{inv_id}", headers=auth).json()
-        if body["status"] in ("completed", "failed"):
-            return body
-        time.sleep(0.1)
-    raise AssertionError(f"investigation never finished: {body}")
+from app import jobs, models, worker
+from app.db import SessionLocal
 
 
-def test_analysis_completes_and_advances_through_the_stages(client, auth, sample_video):
+def _upload(client, auth, sample_video) -> str:
+    res = client.post("/api/investigations", files=sample_video, headers=auth)
+    assert res.status_code == 201, res.text
+    return res.json()["id"]
+
+
+def test_analysis_completes_and_advances_through_the_stages(client, auth, sample_video,
+                                                            wait_for_terminal):
     created = client.post("/api/investigations", files=sample_video, headers=auth).json()
     assert created["status"] == "queued"
 
-    final = _wait_for_terminal(client, auth, created["id"])
+    final = wait_for_terminal(created["id"], auth)
 
     assert final["status"] == "completed", final.get("failure_reason")
     assert final["progress"] == {"stage": "done", "pct": 100}
@@ -27,10 +26,9 @@ def test_analysis_completes_and_advances_through_the_stages(client, auth, sample
     assert final["video"]["sha256"] == created["video"]["sha256"]
 
 
-def test_evidence_images_are_served_as_jpeg(client, auth, sample_video):
-    inv_id = client.post("/api/investigations", files=sample_video,
-                         headers=auth).json()["id"]
-    final = _wait_for_terminal(client, auth, inv_id)
+def test_evidence_images_are_served_as_jpeg(client, auth, sample_video, wait_for_terminal):
+    inv_id = _upload(client, auth, sample_video)
+    final = wait_for_terminal(inv_id, auth)
 
     evidence = final["result"]["evidence"]
     assert evidence, "expected at least one evidence item"
@@ -43,17 +41,15 @@ def test_evidence_images_are_served_as_jpeg(client, auth, sample_video):
         assert img.content[:2] == b"\xff\xd8", "not a JPEG"
 
 
-def test_unknown_evidence_id_is_404(client, auth, sample_video):
-    inv_id = client.post("/api/investigations", files=sample_video,
-                         headers=auth).json()["id"]
-    _wait_for_terminal(client, auth, inv_id)
+def test_unknown_evidence_id_is_404(client, auth, sample_video, wait_for_terminal):
+    inv_id = _upload(client, auth, sample_video)
+    wait_for_terminal(inv_id, auth)
     res = client.get(f"/api/investigations/{inv_id}/evidence/ev-999", headers=auth)
     assert res.status_code == 404
 
 
 def test_investigation_appears_in_the_list_after_upload(client, auth, sample_video):
-    inv_id = client.post("/api/investigations", files=sample_video,
-                         headers=auth).json()["id"]
+    inv_id = _upload(client, auth, sample_video)
     listed = client.get("/api/investigations", headers=auth).json()
     assert inv_id in [i["id"] for i in listed]
     assert listed[0]["id"] == inv_id, "newest investigation should be first"
@@ -65,37 +61,51 @@ def test_two_uploads_get_distinct_ids(client, auth, sample_video):
     assert first["id"] != second["id"]
 
 
-def test_faceless_video_ends_failed_not_stuck(client, auth):
-    """A real pipeline raises 'No face detected'; the job must surface that as `failed`.
+def test_api_queues_the_job_but_does_not_run_it(client, auth, sample_video):
+    """The point of the worker split: the API never analyses anything itself.
 
-    In fake mode we can't produce that condition, so this asserts the failure *contract*
-    by pointing the job at a video row whose storage object is missing.
+    QUEUE_BACKEND=worker here, so no worker thread is running in the API process. An
+    upload must therefore sit untouched until some worker asks for it.
     """
-    from app.db import SessionLocal
-    from app.jobs import run_analysis_job
-    from app import models
+    inv_id = _upload(client, auth, sample_video)
+    time.sleep(0.3)  # give a hypothetical in-process worker every chance to fire
 
-    inv_id = client.post("/api/investigations",
-                         files={"file": ("ghost.mp4", b"x" * 128, "video/mp4")},
-                         headers=auth).json()["id"]
+    body = client.get(f"/api/investigations/{inv_id}", headers=auth).json()
+    assert body["status"] == "queued", "the API must not process jobs itself"
+    assert body["progress"] == {"stage": "ingest", "pct": 5}
+    assert "result" not in body
 
-    db = SessionLocal()
-    try:
-        video = db.get(models.Video, inv_id)
-        video.storage_key = "videos/does-not-exist.mp4"
-        db.commit()
-    finally:
-        db.close()
+    # ...and only a worker moves it
+    assert worker.run_once("test-worker") is True
+    assert client.get(f"/api/investigations/{inv_id}", headers=auth).json()["status"] == "completed"
 
-    # re-run the job directly; it must record the failure rather than raise
-    from app.config import get_settings
-    original = get_settings().analysis_mode
-    get_settings().analysis_mode = "real"
-    try:
-        run_analysis_job(inv_id)
-    finally:
-        get_settings().analysis_mode = original
+
+def test_a_raising_job_ends_failed_not_stuck(client, auth, sample_video,
+                                            wait_for_terminal, monkeypatch):
+    """A job that raises must record the failure, not leave the row on 'processing'.
+
+    The real pipeline raises LookupError('No face detected') on faceless input. Faking
+    that here keeps the test fast and independent of torch.
+    """
+    inv_id = _upload(client, auth, sample_video)
+    wait_for_terminal(inv_id, auth)  # complete it normally first
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("No face detected in any sampled frame")
+
+    monkeypatch.setattr(jobs.mlbridge, "analyze_video", boom)
+    monkeypatch.setattr(jobs.get_settings(), "analysis_mode", "real")
+
+    jobs.run_analysis_job(inv_id)  # must not raise
 
     body = client.get(f"/api/investigations/{inv_id}", headers=auth).json()
     assert body["status"] == "failed"
     assert "result" not in body
+
+    # the reason is kept for diagnosis even though it is not part of the API contract
+    db = SessionLocal()
+    try:
+        row = db.get(models.Investigation, inv_id)
+        assert "No face detected" in (row.failure_reason or "")
+    finally:
+        db.close()

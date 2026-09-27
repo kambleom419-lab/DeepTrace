@@ -102,15 +102,3 @@ export const mockInvestigations: Investigation[] = [
     created_at: '2026-08-27T18:44:00Z',
   },
 ]
-
-// stages in order — used by the mock polling to advance progress
-export const STAGES = [
-  'ingest',
-  'frames',
-  'faces',
-  'spatial',
-  'temporal',
-  'frequency',
-  'fusion',
-  'done',
-] as const

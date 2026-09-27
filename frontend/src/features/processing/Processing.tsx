@@ -4,9 +4,9 @@ import { Check, Loader2, XCircle } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
 import { api } from '@/lib/api'
+import { STAGES } from '@/lib/stages'
 import { cn } from '@/lib/utils'
 import type { AnalysisStage, Investigation } from '@/types'
-import { STAGES } from '@/mocks/fixtures'
 
 const stageLabels: Record<AnalysisStage, string> = {
   ingest: 'Video ingestion',

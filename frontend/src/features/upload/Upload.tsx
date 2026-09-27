@@ -7,7 +7,10 @@ import { api } from '@/lib/api'
 import { formatBytes } from '@/lib/utils'
 
 const ACCEPTED = ['video/mp4', 'video/quicktime', 'video/x-msvideo']
-const MAX_SIZE = 500 * 1024 * 1024 // 500 MB
+// Must stay in step with the backend's MAX_UPLOAD_MB (200 by default). A larger limit here
+// would let the user pick a file, wait for the upload, and only then be rejected by the
+// server - and the backend is the authority anyway.
+const MAX_SIZE = 200 * 1024 * 1024
 
 export default function Upload() {
   const navigate = useNavigate()

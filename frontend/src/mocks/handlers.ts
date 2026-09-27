@@ -1,10 +1,6 @@
 import { http, HttpResponse, delay } from 'msw'
-import {
-  mockInvestigations,
-  mockResult,
-  mockVideoMeta,
-  STAGES,
-} from './fixtures'
+import { STAGES } from '@/lib/stages'
+import { mockInvestigations, mockResult, mockVideoMeta } from './fixtures'
 import type { AuthResponse, Investigation } from '@/types'
 
 // Simulated in-memory state per session so polling behaves like a real backend.

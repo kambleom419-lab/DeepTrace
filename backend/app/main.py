@@ -5,14 +5,15 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session
 
-from app import mlbridge
+from app import mlbridge, queue, worker
 from app.api import auth, investigations
 from app.config import REPO_ROOT, get_settings
-from app.db import init_db
+from app.db import get_db, init_db
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
@@ -42,7 +43,18 @@ async def lifespan(_: FastAPI):
         logger.warning("no frontend build at %s - the API runs, but '/' will 404; "
                        "run `npm run build` in frontend/ to include the UI", DIST_DIR)
 
+    inline_stop = None
+    if settings.worker_in_process:
+        # inference runs on a daemon thread in this process - the one-command dev setup
+        inline_stop = worker.start_background_worker()
+    else:
+        logger.info("WORKER_IN_PROCESS=false: no analysis runs in this process. "
+                    "Start one with `python -m app.worker`.")
+
     yield
+
+    if inline_stop is not None:
+        inline_stop.set()
     logger.info("shutting down")
 
 
@@ -53,12 +65,15 @@ app.include_router(investigations.router, prefix="/api/investigations", tags=["i
 
 
 @app.get("/api/health", tags=["meta"])
-def health() -> dict:
+def health(db: Session = Depends(get_db)) -> dict:
     status = mlbridge.weights_status()
     return {
         "status": "ok",
         "analysis_mode": settings.analysis_mode,
         "storage_backend": settings.storage_backend,
+        "queue_backend": settings.queue_backend,
+        "worker_in_process": settings.worker_in_process,
+        "queue_depth": queue.depth(db),
         "weights_ok": not status["missing"],
         "missing_checkpoints": status["missing"],
     }

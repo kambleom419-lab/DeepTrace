@@ -1,0 +1,116 @@
+# The DeepTrace stack.
+#
+#   docker compose up -d --build     build the image and start everything
+#   docker compose ps                check health
+#   docker compose logs -f worker    watch the worker claim jobs
+#   docker compose down              stop (data survives in the named volumes)
+#   docker compose down -v           stop and DELETE all data
+#
+# Services talk over the compose network by service name - `postgres` and `azurite` - which
+# is why the container connection strings use those hostnames and the host-run setup uses
+# 127.0.0.1. Nothing else about the configuration differs.
+
+name: deeptrace
+
+x-app-environment: &app_environment
+  DATABASE_URL: postgresql+psycopg://deeptrace:deeptrace@postgres:5432/deeptrace
+  # Azure Blob for the video and the heatmaps, Azure Storage Queue for the job messages.
+  # Both endpoints are required, or the queue client looks for *.queue.core.windows.net.
+  STORAGE_BACKEND: azure
+  STORAGE_CONTAINER: deeptrace
+  STORAGE_CONNECTION: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"
+  QUEUE_BACKEND: azure
+  QUEUE_NAME: jobs
+  # In the containers inference is never in the API process: that is the worker's job, so
+  # the two scale independently. This is the difference from the local dev setup.
+  WORKER_IN_PROCESS: "false"
+  ANALYSIS_MODE: ${ANALYSIS_MODE:-real}
+  REQUIRE_WEIGHTS: "true"
+  JWT_SECRET: ${JWT_SECRET:-local-dev-only-not-a-real-secret-please-change-in-azure}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: deeptrace-postgres
+    environment:
+      POSTGRES_USER: deeptrace
+      POSTGRES_PASSWORD: deeptrace   # local only; Azure uses a Container Apps secret
+      POSTGRES_DB: deeptrace
+    ports:
+      - "5433:5432"   # 5432 on the host is already this machine's own PostgreSQL
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deeptrace -d deeptrace"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Azurite is Microsoft's storage emulator: Blob, Queue and Table in one container. The
+  # well-known account name and key below are published in Microsoft's docs and are NOT
+  # secrets - they only ever work against the emulator.
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: deeptrace-azurite
+    # --skipApiVersionCheck: the Azure SDKs ship newer REST API versions than Azurite knows,
+    # and without this it rejects them with "API version not supported by Azurite".
+    command: >
+      azurite
+      --silent
+      --blobHost 0.0.0.0
+      --queueHost 0.0.0.0
+      --location /data
+      --skipApiVersionCheck
+    ports:
+      - "10000:10000"   # blob  - videos and heatmaps
+      - "10001:10001"   # queue - job messages
+      - "10002:10002"   # table - unused
+    volumes:
+      - azurite-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deeptrace-app:local   # shared with the worker: one image, two commands
+    init: true                   # reap zombies and forward SIGTERM properly
+    environment: *app_environment
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      azurite:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # No ports: nothing connects to the worker, it only pulls jobs off the queue. In Azure
+  # this is the replica set that scales on queue length.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deeptrace-app:local
+    init: true
+    command: ["python", "-m", "app.worker"]
+    environment: *app_environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      azurite:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  azurite-data:

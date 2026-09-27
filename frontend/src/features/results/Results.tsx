@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import {
   AlertTriangle,
@@ -98,11 +98,13 @@ function ScoreCard({
   )
 }
 
-function buildTimelineData(result: AnalysisResult) {
+function buildTimelineData(result: AnalysisResult, duration: number) {
   const count = result.frame_scores.length
-  const duration = 48.6 // fallback; real API will provide video.duration
+  // The API reports one score per sampled frame; spread them evenly across the real clip
+  // length. Fall back to 1s per sample if ffprobe could not read the duration.
+  const span = duration > 0 ? duration : count
   return result.frame_scores.map((score, i) => ({
-    t: Number(((i / Math.max(count - 1, 1)) * duration).toFixed(1)),
+    t: Number(((i / Math.max(count - 1, 1)) * span).toFixed(1)),
     score,
   }))
 }
@@ -122,7 +124,54 @@ export default function Results() {
   }, [id])
 
   const result = inv?.result
-  const timeline = useMemo(() => (result ? buildTimelineData(result) : []), [result])
+  const duration = inv?.video?.duration ?? 0
+  const timeline = useMemo(
+    () => (result ? buildTimelineData(result, duration) : []),
+    [result, duration],
+  )
+
+  // Derived before the early returns so the heatmap effect below can hook on it.
+  const activeEvidence = useMemo(() => {
+    if (!result) return null
+    const heatmap = result.evidence.find((e) => e.evidence_type === 'heatmap')
+    return result.evidence.find((e) => e.id === selectedEvidence) ?? heatmap ?? null
+  }, [result, selectedEvidence])
+
+  const evidenceUrl = activeEvidence?.heatmap_url
+  // Keyed by url so a previously viewed heatmap stays valid when the user clicks back to
+  // it, and so switching to an item with no image clears the panel during render rather
+  // than from inside an effect.
+  const [loaded, setLoaded] = useState<{ url: string; src: string } | null>(null)
+  const evidenceSrc = loaded && loaded.url === evidenceUrl ? loaded.src : null
+  const objectUrls = useRef<string[]>([])
+
+  useEffect(() => {
+    if (!evidenceUrl) return
+    let cancelled = false
+    api
+      .fetchEvidenceImage(evidenceUrl)
+      .then((created) => {
+        if (cancelled) {
+          URL.revokeObjectURL(created)
+          return
+        }
+        objectUrls.current.push(created)
+        setLoaded({ url: evidenceUrl, src: created })
+      })
+      .catch(() => setLoaded(null))
+    return () => {
+      cancelled = true
+    }
+  }, [evidenceUrl])
+
+  // Blob URLs live for as long as the page does, then get released all at once.
+  useEffect(
+    () => () => {
+      objectUrls.current.forEach((url) => URL.revokeObjectURL(url))
+      objectUrls.current = []
+    },
+    [],
+  )
 
   if (error) {
     return (
@@ -142,9 +191,6 @@ export default function Results() {
 
   const verdict = verdictConfig[result.verdict]
   const VerdictIcon = verdict.icon
-  const heatmap = result.evidence.find((e) => e.evidence_type === 'heatmap')
-  const activeEvidence =
-    result.evidence.find((e) => e.id === selectedEvidence) ?? heatmap ?? null
 
   return (
     <div className="space-y-6">
@@ -210,14 +256,24 @@ export default function Results() {
           </CardHeader>
           <CardContent>
             <div className="relative aspect-video overflow-hidden rounded-md border border-edge bg-bg">
-              <div className="bg-grid flex h-full w-full flex-col items-center justify-center">
-                <span className="font-mono text-xs uppercase tracking-widest text-ink-faint">
-                  [ grad-cam heatmap ]
-                </span>
-                <span className="mt-1 font-mono text-[0.65rem] text-ink-faint">
-                  frame {activeEvidence?.frame_number ?? '—'} · t={activeEvidence?.timestamp ?? '—'}s
-                </span>
-              </div>
+              {evidenceSrc ? (
+                <img
+                  src={evidenceSrc}
+                  alt={activeEvidence?.description ?? 'Grad-CAM heatmap'}
+                  className="h-full w-full object-contain"
+                />
+              ) : (
+                <div className="bg-grid flex h-full w-full flex-col items-center justify-center">
+                  <span className="font-mono text-xs uppercase tracking-widest text-ink-faint">
+                    {activeEvidence?.heatmap_url
+                      ? '[ loading heatmap ]'
+                      : '[ no heatmap for this item ]'}
+                  </span>
+                  <span className="mt-1 font-mono text-[0.65rem] text-ink-faint">
+                    frame {activeEvidence?.frame_number ?? '—'} · t={activeEvidence?.timestamp ?? '—'}s
+                  </span>
+                </div>
+              )}
             </div>
             {result.evidence.length > 0 && (
               <div className="mt-3 flex flex-wrap gap-2">
@@ -286,22 +342,17 @@ export default function Results() {
                   labelFormatter={(l) => `t = ${l}s`}
                   formatter={(v) => [`${formatPercent(Number(v) || 0)}`, 'score']}
                 />
-                <ReferenceArea
-                  x1={12.4}
-                  x2={15.8}
-                  fill="#f87171"
-                  fillOpacity={0.12}
-                  stroke="#f87171"
-                  strokeOpacity={0.5}
-                />
-                <ReferenceArea
-                  x1={31}
-                  x2={33.5}
-                  fill="#f87171"
-                  fillOpacity={0.12}
-                  stroke="#f87171"
-                  strokeOpacity={0.5}
-                />
+                {result.suspicious_segments.map((s) => (
+                  <ReferenceArea
+                    key={`${s.start}-${s.end}`}
+                    x1={s.start}
+                    x2={s.end}
+                    fill="#f87171"
+                    fillOpacity={0.12}
+                    stroke="#f87171"
+                    strokeOpacity={0.5}
+                  />
+                ))}
                 <Area
                   type="monotone"
                   dataKey="score"

@@ -60,6 +60,13 @@ def run_analysis_job(investigation_id: str) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if settings.analysis_mode == "fake":
+            # The canned result below describes a 48.6 s / 30 fps clip. Record matching
+            # metadata so the UI's timeline and suspicious-segment shading line up exactly
+            # as they did against MSW - fake mode is meant to be a drop-in for the mocks.
+            inv.video.duration = 48.6
+            inv.video.fps = 30.0
+            inv.video.resolution = "1920x1080"
+            db.commit()
             payload = _fake_payload(inv, out_dir)
         else:
             video_path = work_dir / inv.video.filename

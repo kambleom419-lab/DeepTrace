@@ -8,7 +8,6 @@ from pathlib import Path
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -25,7 +24,7 @@ from app import mlbridge, models, schemas
 from app.config import get_settings
 from app.db import get_db
 from app.deps import get_current_user
-from app.jobs import run_analysis_job
+from app.queue import get_transport
 from app.serializers import investigation_to_schema
 from app.stages import STAGE_PCT
 from app.storage import get_storage
@@ -103,7 +102,6 @@ def get_evidence(
 @router.post("", response_model=schemas.Investigation, status_code=status.HTTP_201_CREATED,
              response_model_exclude_none=True)
 async def create_investigation(
-    background: BackgroundTasks,
     file: UploadFile = File(...),
     title: str | None = Form(None),
     user: models.User = Depends(get_current_user),
@@ -112,6 +110,8 @@ async def create_investigation(
     """Accept an upload, store it, and queue the analysis.
 
     Returns immediately: nothing is analysed yet, so there is deliberately no `result`.
+    Inserting the row with status 'queued' *is* the enqueue - a worker claims it from
+    there, whether that worker is a thread in this process or its own container.
     """
     settings = get_settings()
     max_bytes = settings.max_upload_mb * 1024 * 1024
@@ -187,7 +187,13 @@ async def create_investigation(
         db.refresh(inv)
 
         logger.info("queued %s (%s, %d bytes)", inv.id, safe_name, measured)
-        background.add_task(run_analysis_job, inv.id)
+        try:
+            get_transport().enqueue(inv.id)
+        except Exception:  # noqa: BLE001
+            # The row is committed, so the job is not lost: the worker's reconcile sweep
+            # re-sends anything that has been queued too long. A failed send must not turn
+            # a successful upload into an error for the user.
+            logger.exception("could not enqueue %s; reconcile will recover it", inv.id)
         return investigation_to_schema(inv)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

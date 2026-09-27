@@ -42,6 +42,10 @@ class Investigation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Set when a worker claims the job; used to spot jobs abandoned by a worker that died.
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
     video: Mapped[Video | None] = relationship(
         back_populates="investigation", uselist=False, cascade="all, delete-orphan"
     )

@@ -1,3 +1,4 @@
+import { STORED_EMAIL_KEY } from './auth'
 import type {
   AuthResponse,
   Investigation,
@@ -26,6 +27,26 @@ export class ApiError extends Error {
   }
 }
 
+async function errorMessage(res: Response): Promise<string> {
+  try {
+    const body = await res.json()
+    return body.detail ?? body.message ?? res.statusText
+  } catch {
+    return res.statusText
+  }
+}
+
+function handleUnauthorized(path: string) {
+  // A 401 from /auth/* means "wrong credentials" - that belongs on the form, not a redirect.
+  if (path.startsWith('/auth/')) return
+  setToken(null)
+  localStorage.removeItem(STORED_EMAIL_KEY)
+  const { pathname } = window.location
+  if (pathname !== '/login' && pathname !== '/register') {
+    window.location.assign('/login')
+  }
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -37,14 +58,8 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers })
 
   if (!res.ok) {
-    let message = res.statusText
-    try {
-      const body = await res.json()
-      message = body.detail ?? body.message ?? message
-    } catch {
-      /* keep statusText */
-    }
-    throw new ApiError(res.status, message)
+    if (res.status === 401) handleUnauthorized(path)
+    throw new ApiError(res.status, await errorMessage(res))
   }
 
   if (res.status === 204) return undefined as T
@@ -67,11 +82,23 @@ export const api = {
     if (token) headers.Authorization = `Bearer ${token}`
     return fetch(`${API_BASE}/investigations`, { method: 'POST', body: form, headers }).then(
       async (res) => {
-        if (!res.ok) throw new ApiError(res.status, res.statusText)
+        // read `detail` here too, or the UI shows "Unprocessable Entity" instead of the
+        // backend's actual reason (e.g. "File exceeds 200 MB limit")
+        if (!res.ok) throw new ApiError(res.status, await errorMessage(res))
         return res.json() as Promise<Investigation>
       },
     )
   },
   getEvidenceUrl: (investigationId: string, evidenceId: string) =>
     `${API_BASE}/investigations/${investigationId}/evidence/${evidenceId}`,
+  // The evidence route is authenticated, and an <img> tag cannot send an Authorization
+  // header. Fetch the bytes with the token and hand the component a blob URL instead.
+  fetchEvidenceImage: async (url: string): Promise<string> => {
+    const headers: Record<string, string> = {}
+    const token = getToken()
+    if (token) headers.Authorization = `Bearer ${token}`
+    const res = await fetch(url, { headers })
+    if (!res.ok) throw new ApiError(res.status, await errorMessage(res))
+    return URL.createObjectURL(await res.blob())
+  },
 }

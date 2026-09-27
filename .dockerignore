@@ -1,0 +1,42 @@
+# Build context is the repo root, so this file keeps the image small and the build quick.
+
+.git
+.gitignore
+
+# ── the big one: the local virtualenv holds torch and friends (~4 GB) ─────────
+ml/.venv
+**/venv
+**/.venv
+
+# ── NOT excluded: ml/weights/*.pt ────────────────────────────────────────────
+# They are gitignored but required in the image. Excluding them would produce an image
+# whose pipeline silently substitutes _PRIORS and returns meaningless verdicts.
+
+# Training material that the container never needs
+ml/kaggle
+ml/data
+ml/runs
+ml/scratch
+notebook.ipynb
+*.ipynb
+
+frontend/node_modules
+frontend/dist
+docs
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/*.log
+
+# Secrets and local state
+.env
+backend/.env
+backend/_storage
+backend/*.db
+backend/*.sqlite3
+
+# Compose and report material
+docker-compose.yml
+Dockerfile
+.dockerignore
+*.md

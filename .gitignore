@@ -30,6 +30,9 @@ htmlcov/
 .env
 .env.*
 !.env.example
+# Vite loads `.env.<mode>` files, so the mock-off switch for `npm run dev:api` has to be
+# called .env.api. It holds no secrets - it is a build-time flag - so it is committed.
+!frontend/.env.api
 *.pem
 *.key
 *.p12
