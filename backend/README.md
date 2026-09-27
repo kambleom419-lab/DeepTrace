@@ -29,9 +29,9 @@ The full plan lives at `~/.commandcode/plans/deeptrace-backend-cloud-deployment.
 |---|---|---|
 | **1. Contract-complete API, no cloud** | FastAPI + SQLite, all six endpoints, and the frontend talking to the real API instead of its in-browser mocks. | ✅ **Done and verified** |
 | **2. Real worker + queue** | Inference moved out of the API process into a worker that claims jobs from a queue. | ✅ **Done and verified** |
-| **3. Postgres + Blob, locally** | `docker-compose` with PostgreSQL and the Azurite storage emulator. Real Azure SDKs, no cloud account. | ✅ **Done and verified** |
-| **4. Containerise** | Dockerfile; `docker compose up` runs api + worker + postgres + azurite. | ✅ **Done and verified** |
-| **5. Provision Azure** | Resource group, ACR, Storage, PostgreSQL, Log Analytics, Container Apps. | ⬜ Next |
+| **3. Postgres + blob storage, locally** | `docker-compose` with PostgreSQL plus an emulator for each cloud: Moto for S3/SQS, Azurite for Blob/Queue. Real SDKs, no cloud account. | ✅ **Done and verified** |
+| **4. Containerise** | Dockerfile; `docker compose up` runs api + worker + postgres + moto. | ✅ **Done and verified** |
+| **5. Provision AWS** | ECR, S3, SQS, RDS PostgreSQL, ECS Fargate + ALB, Secrets Manager, CloudWatch. | ⬜ Next |
 | **6. Deploy, verify, load-test** | Public HTTPS URL, autoscaling worker, dashboards and alerts. | ⬜ |
 | **7. Report artefacts** | Diagrams, screenshots, sample input/output. | ⬜ |
 
@@ -52,7 +52,8 @@ Two settings decide how a job reaches a worker, and they are independent:
 | Value | Message carrier | Notes |
 |---|---|---|
 | `database` | the queued row itself | No extra infrastructure, transactional with the data it protects |
-| `azure` | an Azure Storage Queue message | Azurite locally; the queue the containers use |
+| `azure` | an Azure Storage Queue message | Azurite locally |
+| `sqs` | an AWS SQS message | Moto locally; the queue the containers use |
 
 **Who runs the worker loop** — `WORKER_IN_PROCESS`:
 
@@ -61,7 +62,7 @@ Two settings decide how a job reaches a worker, and they are independent:
 | `true` (default) | A daemon thread inside the API process, so `uvicorn app.main:app` alone is a complete system |
 | `false` | The API only queues. Something else must run `python -m app.worker` |
 
-The containers use `azure` + `false`: the worker is its own service that scales independently
+The containers use `sqs` + `false`: the worker is its own service that scales independently
 of the API, which is the whole point of the split.
 
 ### Why the database is still the source of truth
@@ -86,24 +87,28 @@ queue. Re-running is safe because analysis replaces its previous result.
 
 ### Where the rows, the bytes and the messages live
 
-All three are behind environment variables, so no calling code knows which backend is in use:
+The rows, the bytes and the messages are each selected by one of these:
 
-| Setting | Development (no cloud account) | Azure |
-|---|---|---|
-| `STORAGE_BACKEND=local` | a directory under `backend/_storage/` | — |
-| `STORAGE_BACKEND=azure` | **Azurite** in Docker | Azure Blob Storage |
-| `DATABASE_URL=sqlite://…` | one file, no server | — |
-| `DATABASE_URL=postgresql+psycopg://…` | **PostgreSQL** in Docker | Azure Database for PostgreSQL |
-| `QUEUE_BACKEND=database` | the row itself is the message | — |
-| `QUEUE_BACKEND=azure` | **Azurite** in Docker | Azure Storage Queue |
+| Setting | Local (no cloud account) | AWS | Azure |
+|---|---|---|---|
+| `STORAGE_BACKEND=local` | a directory under `backend/_storage/` | — | — |
+| `STORAGE_BACKEND=s3` | **Moto** in Docker | S3 | — |
+| `STORAGE_BACKEND=azure` | **Azurite** in Docker | — | Blob Storage |
+| `DATABASE_URL=sqlite://…` | one file, no server | — | — |
+| `DATABASE_URL=postgresql+psycopg://…` | **PostgreSQL** in Docker | RDS | Azure Database for PostgreSQL |
+| `QUEUE_BACKEND=database` | the row itself is the message | — | — |
+| `QUEUE_BACKEND=sqs` | **Moto** in Docker | SQS | — |
+| `QUEUE_BACKEND=azure` | **Azurite** in Docker | — | Storage Queue |
 
-All three are environment variables, so no calling code knows which backend is in use. The
-`docker-compose.yml` at the repo root brings up Postgres and Azurite so the app runs against
-the same service shapes as Azure, completely offline. That is the whole point of Phase 3: if
+Every one of those is an environment variable, so no calling code knows which backend is in
+use. The `docker-compose.yml` at the repo root brings up Postgres and Moto so the app runs
+against the same service shapes as AWS, completely offline. That is the point of Phase 3: if
 it works here, the only thing left to change for the cloud is a set of connection strings.
 
-Azurite's account name and key are published in Microsoft's documentation — they are **not**
-secrets and only ever work against the emulator.
+Moto needs no account, no token and no signup. That is why it replaced MinIO, which deleted
+its community Docker images in 2026, and LocalStack, whose image now refuses to start without
+an account-bound auth token. Azurite's account name and key are published in Microsoft's
+documentation — they are **not** secrets and only ever work against the emulator.
 
 ---
 
@@ -122,11 +127,11 @@ backend/
 │   ├── deps.py             get_current_user (Bearer token) dependency
 │   ├── stages.py           the 8 analysis stage names + percentages
 │   ├── mlbridge.py         the ONLY place that imports ml/ (+ weights guard)
-│   ├── storage.py          Blob/local storage behind one interface
+│   ├── storage.py          S3 / Azure Blob / local, behind one interface
 │   ├── serializers.py      database rows -> API response shapes
 │   ├── logsetup.py         shared logging config (also silences the Azure SDK)
 │   ├── jobs.py             the analysis job itself (transport-agnostic)
-│   ├── queue.py            the queue: database or Azure Storage Queue
+│   ├── queue.py            the queue: database, SQS or Azure Storage Queue
 │   ├── worker.py           the claim-and-run loop; `python -m app.worker`
 │   └── api/
 │       ├── auth.py         POST /api/auth/register, /login
@@ -136,7 +141,7 @@ backend/
 │   ├── test_contract.py    the shapes the frontend depends on
 │   ├── test_flow.py        upload -> queued -> completed -> evidence served
 │   ├── test_worker.py      claiming, contention, stale-claim recovery
-│   ├── test_queue_transport.py  both transports, including duplicate delivery
+│   ├── test_queue_transport.py  all three transports, including duplicate delivery
 │   └── test_storage.py     the storage interface, backend-agnostic
 ├── requirements.txt
 └── .env.example
@@ -146,7 +151,7 @@ Plus, at the repo root:
 
 | File | Purpose |
 |---|---|
-| `docker-compose.yml` | postgres + azurite, and from Phase 4 the api + worker containers |
+| `docker-compose.yml` | postgres + moto, the api + worker containers, and azurite behind a profile |
 | `Dockerfile` | builds the frontend, then the Python image with ffmpeg and the face model |
 | `.dockerignore` | keeps `ml/.venv` and friends out of the build context |
 
@@ -154,7 +159,7 @@ Plus, at the repo root:
 
 | Missing | Arrives in | Why it's deferred |
 |---|---|---|
-| Any Azure resources | Phase 5 | Everything so far runs offline |
+| Any AWS resources | Phase 5 | Everything so far runs offline |
 | Autoscaling, monitoring, alerts | Phase 6 | Needs something deployed to observe |
 
 ---
@@ -170,7 +175,7 @@ docker compose ps          # api healthy, worker up
 ```
 
 This builds the image (frontend included) and starts four containers — `api`, `worker`,
-`postgres`, `azurite`. The app is then on **http://localhost:8000**, serving both the API and
+`postgres`, `moto`. The app is then on **http://localhost:8000**, serving both the API and
 the UI, because the API serves the built frontend on its own origin.
 
 ```powershell
@@ -199,7 +204,7 @@ the two backing services and run the app against them from `backend/`.
 
 ```powershell
 cd ..                 # repo root, where docker-compose.yml lives
-docker compose up -d  # PostgreSQL on 5433, Azurite on 10000-10002
+docker compose up -d  # PostgreSQL on 5433, Moto on 5000 (S3 and SQS)
 docker compose ps     # wait until postgres reports (healthy)
 ```
 
@@ -292,13 +297,17 @@ The ones that matter most:
 | Variable | Default | Notes |
 |---|---|---|
 | `DATABASE_URL` | `sqlite:///./deeptrace.db` | A file by default; `.env.example` points it at PostgreSQL |
-| `STORAGE_BACKEND` | `local` | `azure` = Blob: Azurite locally, Azure in the cloud |
-| `STORAGE_CONNECTION` | *(empty)* | Required when `STORAGE_BACKEND=azure` |
-| `STORAGE_CONTAINER` | `deeptrace` | Blob container name |
-| `QUEUE_BACKEND` | `database` | `azure` uses Azure Storage Queue (Azurite locally) |
+| `STORAGE_BACKEND` | `local` | `s3` = an S3 bucket (Moto locally, S3 in AWS); `azure` = Blob; `local` = a directory |
+| `S3_BUCKET` / `S3_REGION` | `deeptrace` / `ap-south-1` | Bucket and region; the deployment sets both in AWS |
+| `S3_ENDPOINT_URL` | *(empty)* | Point at Moto locally. **Leave empty in AWS** |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | *(empty)* | Dummy values for Moto. **Leave empty in AWS**, where the task role supplies them |
+| `QUEUE_BACKEND` | `database` | `sqs` = AWS SQS (Moto locally); `azure` = Azure Storage Queue |
+| `QUEUE_WAIT_SECONDS` | `20` | SQS long polling: how long an empty receive blocks. Keeps an idle worker inside the free tier |
+| `STORAGE_CONNECTION` | *(empty)* | Only used when `STORAGE_BACKEND=azure`; falls back from `QUEUE_CONNECTION` |
+| `STORAGE_CONTAINER` | `deeptrace` | Blob container name, Azure only |
 | `WORKER_IN_PROCESS` | `true` | `false` runs the worker as its own process (see above) |
-| `QUEUE_NAME` | `jobs` | Queue name; `QUEUE_CONNECTION` falls back to `STORAGE_CONNECTION` |
-| `JWT_SECRET` | `dev-secret-change-me` | **Must be changed.** In Azure it comes from a Container Apps secret. |
+| `QUEUE_NAME` | `jobs` | Queue name, used by both message transports |
+| `JWT_SECRET` | `dev-secret-change-me` | **Must be changed.** In the cloud it comes from a secret store, never from this file. |
 | `ANALYSIS_MODE` | `real` | `fake` for tests/UI work |
 | `REQUIRE_WEIGHTS` | `true` | Refuse to start without the 4 checkpoints |
 | `STALE_CLAIM_MINUTES` | `30` | How long a claim may sit idle before another worker takes the job back |
@@ -312,7 +321,7 @@ cd backend
 ..\ml\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
-**40 tests, all passing — on both stacks.** They cover five things:
+**40 tests, all passing — on every stack.** They cover five things:
 
 - **`test_contract.py`** — the promise made in `frontend/src/types/index.ts`. Status codes,
   field names, that `_meta` never leaks into a result, that `progress.stage` is always one of
@@ -321,10 +330,10 @@ cd backend
   API itself never analyses anything, and that a raising job ends `failed` rather than stuck.
 - **`test_worker.py`** — claiming takes a job exactly once, two workers never get the same
   job, a dead worker's claim is recovered, and a live worker keeps its job.
-- **`test_queue_transport.py`** — both transports behave identically, including the case that
-  matters: a duplicate delivery must not run the job twice.
+- **`test_queue_transport.py`** — all three transports behave identically, including the case
+  that matters: a duplicate delivery must not run the job twice.
 - **`test_storage.py`** — the storage interface, deliberately backend-agnostic so it passes
-  against local files *and* Azurite.
+  against local files, Moto *and* Azurite.
 
 Tests run in `ANALYSIS_MODE=fake` with a throwaway database and storage, so they need no GPU,
 no network and no model files. They set `WORKER_IN_PROCESS=false` and drive `worker.run_once()`
@@ -338,6 +347,16 @@ the same suite runs against the cloud service shapes with no code changes:
 # SQLite + local files + database queue (fast, no Docker needed)
 ..\ml\.venv\Scripts\python.exe -m pytest tests -q
 
+# PostgreSQL + Moto (S3 *and* SQS) - the stack the containers run
+$env:DATABASE_URL="postgresql+psycopg://deeptrace:deeptrace@127.0.0.1:5433/deeptrace_test"
+$env:STORAGE_BACKEND="s3"
+$env:S3_ENDPOINT_URL="http://127.0.0.1:5000"
+$env:S3_ACCESS_KEY="testing"
+$env:S3_SECRET_KEY="testing"
+$env:S3_REGION="us-east-1"
+$env:QUEUE_BACKEND="sqs"
+..\ml\.venv\Scripts\python.exe -m pytest tests -q
+
 # PostgreSQL + Azurite (Blob *and* Azure Storage Queue)
 $env:DATABASE_URL="postgresql+psycopg://deeptrace:deeptrace@127.0.0.1:5433/deeptrace_test"
 $env:STORAGE_BACKEND="azure"
@@ -346,9 +365,9 @@ $env:QUEUE_BACKEND="azure"
 ..\ml\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
-The same 40 passing on both is the evidence that the two storage backends, the two queue
-transports and the two databases really are interchangeable — which is what makes the move to
-Azure a set of connection strings rather than a rewrite.
+The same 40 passing on all of them is the evidence that the three storage backends, the three
+queue transports and the two databases really are interchangeable — which is what makes a
+change of cloud provider a set of connection strings rather than a rewrite.
 
 ### Manual end-to-end check
 
@@ -414,19 +433,23 @@ removed from the API response. A test asserts this.
 
 ## Known limitations
 
-- **Real inference hasn't been exercised over HTTP yet** — the repository contains no video
-  with a face. Needs one real clip from the ff-c23 or celeb-df datasets. The fake-mode path is
-  fully verified, and the real path is verified at the model-loading level.
+- **Real inference has not yet been run on a video containing a face.** Everything around it
+  is verified inside the container: torch and the four checkpoints load, the video is fetched
+  out of S3, frames are extracted, and face detection runs. A clip with no face is then
+  correctly refused — `No face detected in any sampled frame` — instead of being handed an
+  invented verdict. What is missing is one real clip from the ff-c23 or celeb-df datasets;
+  until there is one, only the `fake` path reaches a completed result.
 - **No migrations.** A schema change means dropping and recreating the database, so there is
   no way to evolve a deployed database in place. Alembic is the standard answer.
-- **The worker polls.** Azure Storage Queue has no push delivery, so a worker calls
-  `receive_messages` once a second. That is inherent to the service rather than a shortcut,
-  and it is one cheap HTTP call per second per idle worker.
+- **The worker polls, but cheaply.** Neither Azure Storage Queue nor SQS pushes work to an
+  idle worker, so it calls receive in a loop. SQS long polling (`QUEUE_WAIT_SECONDS=20`) means
+  an idle worker makes roughly 3 requests a minute instead of 60, which keeps it inside the
+  free tier. This is inherent to both services rather than a shortcut.
 - **The image is 5.2 GB**, against the plan's estimate of 2.5–3.5 GB. Two contributors: the
   single-stage build keeps `build-essential` in the final layer, and torch's CPU wheel plus
   onnxruntime are large. Purging `build-essential` in the same `RUN` that uses it would claw
   some back, at the cost of re-installing on every dependency change. It matters because
-  image size drives Container Apps cold-start time.
+  image size drives ECS task cold-start time.
 - **No retry on transient failure.** A job that raises is marked `failed` immediately; only
   *interrupted* jobs (stale claims) get re-run automatically.
 - **Fixed decision thresholds misclassify out-of-distribution video** — a known ML issue

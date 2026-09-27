@@ -6,27 +6,40 @@
 #   docker compose down              stop (data survives in the named volumes)
 #   docker compose down -v           stop and DELETE all data
 #
-# Services talk over the compose network by service name - `postgres` and `azurite` - which
-# is why the container connection strings use those hostnames and the host-run setup uses
-# 127.0.0.1. Nothing else about the configuration differs.
+# Services talk over the compose network by service name - `postgres` and `moto` - which is
+# why the container endpoints use those hostnames and the host-run setup uses 127.0.0.1.
+# Nothing else about the configuration differs.
 
 name: deeptrace
 
 x-app-environment: &app_environment
   DATABASE_URL: postgresql+psycopg://deeptrace:deeptrace@postgres:5432/deeptrace
-  # Azure Blob for the video and the heatmaps, Azure Storage Queue for the job messages.
-  # Both endpoints are required, or the queue client looks for *.queue.core.windows.net.
-  STORAGE_BACKEND: azure
-  STORAGE_CONTAINER: deeptrace
-  STORAGE_CONNECTION: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"
-  QUEUE_BACKEND: azure
+  # S3 holds the video and the heatmaps; SQS carries the job messages. In AWS neither needs
+  # an endpoint or a key, because the ECS task role supplies the credentials - which is why
+  # there is no secret here to leak. Locally both point at Moto, one port for both services.
+  STORAGE_BACKEND: s3
+  S3_BUCKET: deeptrace
+  S3_REGION: us-east-1
+  S3_ENDPOINT_URL: http://moto:5000
+  # Dummy credentials. Moto accepts any string; they are here only because boto3 insists on
+  # being given something once there is no task role to fall back on.
+  S3_ACCESS_KEY: testing
+  S3_SECRET_KEY: testing
+  QUEUE_BACKEND: sqs
   QUEUE_NAME: jobs
+  # Long polling: an idle worker then makes 3 SQS requests a minute instead of 60, which is
+  # the difference between living inside the free tier and spending the credit on nothing.
+  QUEUE_WAIT_SECONDS: "20"
+  # To run this stack against the Azure backends instead - both are still supported, and both
+  # pass the same suite - start azurite with `--profile azure` and swap the block above for
+  # STORAGE_BACKEND=azure / STORAGE_CONTAINER=deeptrace / STORAGE_CONNECTION=<Azurite
+  # connection string> / QUEUE_BACKEND=azure. backend/.env.example has the literal string.
   # In the containers inference is never in the API process: that is the worker's job, so
   # the two scale independently. This is the difference from the local dev setup.
   WORKER_IN_PROCESS: "false"
   ANALYSIS_MODE: ${ANALYSIS_MODE:-real}
   REQUIRE_WEIGHTS: "true"
-  JWT_SECRET: ${JWT_SECRET:-local-dev-only-not-a-real-secret-please-change-in-azure}
+  JWT_SECRET: ${JWT_SECRET:-local-dev-only-not-a-real-secret-please-change-in-the-cloud}
 
 services:
   postgres:
@@ -46,12 +59,15 @@ services:
       timeout: 5s
       retries: 12
 
-  # Azurite is Microsoft's storage emulator: Blob, Queue and Table in one container. The
-  # well-known account name and key below are published in Microsoft's docs and are NOT
-  # secrets - they only ever work against the emulator.
+  # Azurite is Microsoft's storage emulator: Blob, Queue and Table in one container. It sits
+  # behind a profile, so a plain `docker compose up` does not start it - the default stack is
+  # the AWS one. Start it with `docker compose --profile azure up -d`. The well-known account
+  # name and key below are published in Microsoft's docs and are NOT secrets; they only ever
+  # work against the emulator.
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:latest
     container_name: deeptrace-azurite
+    profiles: ["azure"]
     # --skipApiVersionCheck: the Azure SDKs ship newer REST API versions than Azurite knows,
     # and without this it rejects them with "API version not supported by Azurite".
     command: >
@@ -97,7 +113,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      azurite:
+      moto:
         condition: service_started
     healthcheck:
       test:
@@ -111,8 +127,8 @@ services:
       start_period: 30s
     restart: unless-stopped
 
-  # No ports: nothing connects to the worker, it only pulls jobs off the queue. In Azure
-  # this is the replica set that scales on queue length.
+  # No ports: nothing connects to the worker, it only pulls jobs off the queue. In AWS this
+  # is the ECS service that scales on queue depth.
   worker:
     build:
       context: .
@@ -124,7 +140,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      azurite:
+      moto:
         condition: service_started
     restart: unless-stopped
 

@@ -50,7 +50,7 @@ RUN grep -vE '^(torch|torchvision|opencv-python)' /app/ml/requirements.txt > /tm
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install -r /app/backend/requirements.txt
 
-# Bake the face model in at build time. Otherwise the first analysis inside Azure downloads
+# Bake the face model in at build time. Otherwise the first analysis in the cloud downloads
 # ~300 MB to ~/.insightface and needs outbound network - a cold-start failure waiting to
 # happen, in the one code path that is hardest to debug in production.
 RUN python -c "\

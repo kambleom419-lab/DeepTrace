@@ -29,11 +29,6 @@ os.environ.setdefault("QUEUE_BACKEND", "database")  # set to azure or sqs to tes
 # duration, and the drain fixture below receives once per test, so the suite would spend
 # twenty seconds per test waiting for nothing.
 os.environ["QUEUE_WAIT_SECONDS"] = "0"
-# The other two windows normally stop a worker being handed a live job, and stop reconcile
-# re-sending a message that is merely still in flight. At 0 they mean "recover everything",
-# which is what the drain fixture needs - see its docstring.
-os.environ["QUEUE_RECONCILE_MINUTES"] = "0"
-os.environ["STALE_CLAIM_MINUTES"] = "0"
 os.environ["WORKER_IN_PROCESS"] = "false"  # tests drive worker.run_once() themselves
 os.environ["ANALYSIS_MODE"] = "fake"
 os.environ["REQUIRE_WEIGHTS"] = "false"
@@ -41,12 +36,55 @@ os.environ["JWT_SECRET"] = "test-secret-long-enough-for-hs256-signing"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import delete, select  # noqa: E402
 
-from app import worker  # noqa: E402
+from app import models, worker  # noqa: E402
+from app.db import SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
 
 EMAIL = "tester@example.com"
 PASSWORD = "correct-horse"
+
+# How many messages the drain below is willing to consume. It is a fixed count rather than a
+# "keep going while there is work" loop on purpose: receive() returns None both for an empty
+# queue and for a duplicate it has just discarded, so such a loop cannot tell "finished" from
+# "skipped that one" and would exit with messages still queued - which is the bug that
+# produced this comment. Every test clears the queue, so the leftovers never exceed what one
+# test can enqueue, which is two uploads; 25 is deliberate headroom. Each call is an HTTP
+# round trip to the emulator, so a much larger number would be paid for on every test.
+DRAIN_MESSAGES = 25
+
+
+def _delete_pending_rows() -> None:
+    """Delete rows a test left mid-flight, along with their children.
+
+    test_worker.py deliberately claims and requeues jobs by calling queue.claim_next and
+    queue.requeue_stale directly, which bypasses the transport: the row goes back to
+    'queued' while its message was consumed long ago, so no receive can ever find it again.
+    Left alone it leaks into the next test, and claim_next then hands back the wrong job.
+
+    That is exactly how the SQS transport first failed here, after the database transport
+    had hidden the problem for the whole project - for that transport "drain the queue" and
+    "find every queued row" are the same operation, so the divergence could never show.
+
+    Children go first because the foreign keys are not declared ON DELETE CASCADE, so this
+    has to stay correct on PostgreSQL as well as on SQLite.
+    """
+    db = SessionLocal()
+    try:
+        pending = select(models.Investigation.id).where(
+            models.Investigation.status.in_(("queued", "processing"))
+        )
+        for child in (models.Evidence, models.AnalysisResultRow, models.Video):
+            db.execute(delete(child).where(child.investigation_id.in_(pending)))
+        db.execute(
+            delete(models.Investigation).where(
+                models.Investigation.status.in_(("queued", "processing"))
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
 
 
 @pytest.fixture(scope="session")
@@ -80,19 +118,20 @@ def drain_queue(client):
     touch the app - `pytest tests/test_storage.py` - fails here in teardown with
     "no such table: investigations" instead of passing.
 
-    Sweeps before receiving, and that order is load-bearing. test_worker.py claims and
+    Two steps, because either one alone leaves something behind. test_worker.py claims and
     requeues rows by calling queue.claim_next and queue.requeue_stale directly, which
     bypasses the transport and leaves a pending row whose message was consumed long ago.
     No receive can ever find that row, so it would survive into the next test and make
-    claim_next hand back the wrong job. The database transport hid this for the whole
-    project, because for it "drain the queue" and "find every queued row" are the same
-    operation. sweep() re-sends a message for anything still pending - production's own
-    recovery path - which makes this correct for all three transports rather than one.
+    claim_next hand back the wrong job.
     """
     yield
-    worker.sweep()
-    while worker.run_once("test-drainer"):
-        pass
+    # Consume whatever the transport still holds. Bounded rather than "while there is work",
+    # for the reason given on DRAIN_MESSAGES.
+    for _ in range(DRAIN_MESSAGES):
+        worker.run_once("test-drainer")
+    # Then clear rows the loop could not reach: the ones whose message was consumed by a
+    # test calling claim_next directly. See _delete_pending_rows.
+    _delete_pending_rows()
 
 
 @pytest.fixture
