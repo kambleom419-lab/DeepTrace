@@ -85,12 +85,18 @@ class AzureBlobStorage:
         if self._ready:
             return
 
-        from azure.core.exceptions import ResourceExistsError
+        from azure.core.exceptions import HttpResponseError, ResourceExistsError
 
         try:
             self._client.create_container()
         except ResourceExistsError:
             pass  # someone else created it, or a previous run did
+        except HttpResponseError as exc:
+            # Same reasoning as S3Storage._ensure_bucket: a credential scoped so it cannot
+            # create a container is normal in the cloud, where the deployment makes it, and
+            # it must not turn every upload into a 500.
+            if exc.status_code not in (401, 403):
+                raise
         self._ready = True
 
     def put_file(self, key: str, src: Path) -> str:
@@ -154,7 +160,15 @@ class S3Storage:
         self._ready = False
 
     def _ensure_bucket(self) -> None:
-        """Create the bucket on first use, so start-up does not require S3 to be up."""
+        """Create the bucket on first use, so start-up does not require S3 to be up.
+
+        Best-effort, and that word is load-bearing. Locally the emulator needs the bucket
+        made for it, but in AWS the deployment creates the bucket and the task role
+        deliberately has no `s3:CreateBucket` - so treating a denial as a failure made every
+        single upload return 500 for the sake of a convenience only local development needs.
+        A denial therefore means "assume it is already there"; if it genuinely is not, the
+        PutObject that follows says so plainly.
+        """
         if self._ready:
             return
 
@@ -171,7 +185,7 @@ class S3Storage:
                 )
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
-            if code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+            if code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists", "AccessDenied"):
                 raise
         self._ready = True
 

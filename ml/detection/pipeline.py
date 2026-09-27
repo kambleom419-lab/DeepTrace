@@ -193,7 +193,14 @@ class Analyzer:
         fusion_prob = _PRIORS["fusion"]
         if self.fusion is not None:
             with torch.no_grad():
-                fusion_prob = float(torch.sigmoid(self.fusion(torch.from_numpy(fused_vec).float())).item())
+                # unsqueeze -> (1,D). FusionHead opens with a BatchNorm1d, which needs a
+                # batch dimension, and this was the ONLY call site that omitted it -
+                # train.py and the Kaggle notebook both pass (1,D). Without it every video
+                # containing a detectable face died right here, so the real path could never
+                # produce a verdict; it only looked fine because the tests run in fake mode
+                # and most local clips have no face to detect.
+                fusion_prob = float(torch.sigmoid(
+                    self.fusion(torch.from_numpy(fused_vec).float().unsqueeze(0))).item())
         _stage("fusion")
 
         spatial_prob = float(sp_mean(sp_probs))

@@ -433,12 +433,19 @@ removed from the API response. A test asserts this.
 
 ## Known limitations
 
-- **Real inference has not yet been run on a video containing a face.** Everything around it
-  is verified inside the container: torch and the four checkpoints load, the video is fetched
-  out of S3, frames are extracted, and face detection runs. A clip with no face is then
-  correctly refused — `No face detected in any sampled frame` — instead of being handed an
-  invented verdict. What is missing is one real clip from the ff-c23 or celeb-df datasets;
-  until there is one, only the `fake` path reaches a completed result.
+- **The real path could not produce a verdict at all until it was fixed.** `pipeline.py`
+  called the fusion head without a batch dimension, which its `BatchNorm1d` rejects, so every
+  video containing a detectable face died there. Nothing caught it: the tests run in `fake`
+  mode, which never touches the ML, and most local clips have no detectable face so they bail
+  earlier. Fixed in `ml/detection/pipeline.py`; real inference now completes, writes Grad-CAM
+  heatmaps, and stores them in S3. The model itself was never at fault — the evaluation
+  numbers in `docs/kaggle-pipeline-brief.md` come from the Kaggle eval path, which already
+  passed the batch dimension correctly and was unaffected.
+- **Only out-of-distribution clips are available locally.** `ml/data/synthetic/` has labelled
+  real/fake clips, but they are not from the ff-c23 / celeb-df training sets, so verdicts on
+  them are not a measure of accuracy — one scores `INCONCLUSIVE` at 0.48, leaning fake on
+  spatial and temporal but below the 0.6 threshold. This is the fixed-threshold calibration
+  problem below, not a new one.
 - **No migrations.** A schema change means dropping and recreating the database, so there is
   no way to evolve a deployed database in place. Alembic is the standard answer.
 - **The worker polls, but cheaply.** Neither Azure Storage Queue nor SQS pushes work to an
