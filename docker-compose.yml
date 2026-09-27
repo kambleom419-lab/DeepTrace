@@ -68,6 +68,23 @@ services:
     volumes:
       - azurite-data:/data
 
+  # Moto is the local stand-in for S3 and SQS. It is the third kind of emulator in this
+  # file, and the reason for it is boring: MinIO deleted its community Docker images in
+  # 2026, and LocalStack's image now refuses to start without an account-bound auth token.
+  # Moto needs no account, no token and no signup, and covers both services in one
+  # container - which is why it is the pragmatic choice for a project that must stay free.
+  #
+  # It holds state in memory, so `docker compose restart moto` empties every bucket and
+  # queue. That only matters if you restart it mid-session; the database would keep rows
+  # pointing at bytes that no longer exist, so reset both together (`down -v`).
+  moto:
+    image: motoserver/moto:latest
+    container_name: deeptrace-moto
+    ports:
+      - "5000:5000"   # S3 and SQS on one endpoint
+    environment:
+      MOTO_PORT: 5000
+
   api:
     build:
       context: .

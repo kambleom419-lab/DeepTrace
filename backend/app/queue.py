@@ -1,14 +1,15 @@
 """The job queue: how a job gets from the API process to a worker process.
 
-Two transports, chosen by QUEUE_BACKEND:
+Three transports, chosen by QUEUE_BACKEND:
 
-| Value      | Message carrier                        | Works offline via |
-|------------|----------------------------------------|-------------------|
-| `database` | the investigation row itself           | —                 |
-| `azure`    | an Azure Storage Queue message         | Azurite           |
+| Value      | Message carrier                | Works offline via |
+|------------|--------------------------------|-------------------|
+| `database` | the investigation row itself   | —                 |
+| `azure`    | an Azure Storage Queue message | Azurite           |
+| `sqs`      | an AWS SQS message             | Moto              |
 
-The database is the **source of truth** either way. The queue only decides how a worker
-finds out there is work, which is what makes the two interchangeable - and what makes
+The database is the **source of truth** in all three cases. The queue only decides how a
+worker finds out there is work, which is what makes them interchangeable - and what makes
 losing a message survivable rather than fatal.
 
 Two properties of a real queue drive the design:
@@ -178,7 +179,47 @@ class DatabaseTransport:
         return requeue_stale(db, get_settings().stale_claim_minutes)
 
 
-class AzureQueueTransport:
+class MessageQueueTransport:
+    """Behaviour shared by every transport that carries an explicit message.
+
+    Azure Queues and SQS differ only in how a message is sent, received and deleted.
+    Everything else is a property of *any* at-least-once queue - recovering jobs abandoned
+    by a dead worker, re-sending messages that went missing, dropping duplicate deliveries -
+    so it is written once here instead of twice. The line count is the smaller reason: this
+    is also what stops the two transports drifting apart as one of them gets fixed.
+    """
+
+    name = ""
+
+    def enqueue(self, investigation_id: str) -> None:
+        raise NotImplementedError
+
+    def _delete(self, message) -> None:
+        raise NotImplementedError
+
+    def reconcile(self, db: Session) -> int:
+        recovered = requeue_stale(db, get_settings().stale_claim_minutes)
+
+        # A message is lost if the API died between committing the row and sending it, so
+        # re-send anything that has been queued long enough to have been delivered by now.
+        # Duplicates are harmless - the claim compares and swaps.
+        for investigation_id in queued_ids_older_than(db, get_settings().queue_reconcile_minutes):
+            logger.warning("re-enqueueing %s (its message never arrived)", investigation_id)
+            self.enqueue(investigation_id)
+
+        return recovered
+
+    def _discard_duplicate(self, worker_id: str, investigation_id: str, message) -> None:
+        """Drop a message the database says is not ours: a duplicate, or a stale leftover.
+
+        Deleting it rather than letting the visibility timeout run out keeps the queue depth
+        honest - otherwise /api/health would report work that no worker will ever do.
+        """
+        logger.info("[%s] discarding duplicate message for %s", worker_id, investigation_id)
+        self._delete(message)
+
+
+class AzureQueueTransport(MessageQueueTransport):
     """Azure Storage Queue. Locally this is the Azurite queue service."""
 
     name = "azure"
@@ -218,30 +259,102 @@ class AzureQueueTransport:
             if claim_job(db, investigation_id, worker_id):
                 return Job(investigation_id, _ack=lambda: self._delete(message))
 
-            # Already claimed or finished: this is a duplicate delivery, or a leftover from
-            # a run whose database is gone. Either way the row is the authority, so drop it.
-            logger.info("[%s] discarding duplicate message for %s", worker_id, investigation_id)
-            self._delete(message)
+            self._discard_duplicate(worker_id, investigation_id, message)
 
         return None
-
-    def reconcile(self, db: Session) -> int:
-        recovered = requeue_stale(db, get_settings().stale_claim_minutes)
-
-        # A message is lost if the API died between committing the row and sending it, so
-        # re-send anything that has been queued long enough to have been delivered by now.
-        # Duplicates are harmless - the claim compares and swaps.
-        for investigation_id in queued_ids_older_than(db, get_settings().queue_reconcile_minutes):
-            logger.warning("re-enqueueing %s (its message never arrived)", investigation_id)
-            self.enqueue(investigation_id)
-
-        return recovered
 
     def _delete(self, message) -> None:
         try:
             self._client.delete_message(message)
         except Exception:  # noqa: BLE001 - the visibility timeout will expire it anyway
             logger.exception("could not delete queue message %s", getattr(message, "id", "?"))
+
+
+class SqsQueueTransport(MessageQueueTransport):
+    """AWS SQS. Locally this is the Moto emulator, on the same endpoint as S3.
+
+    SQS standard queues are explicitly at-least-once, which is precisely the guarantee the
+    claim compare-and-swap was written for: a redelivered message finds the row already
+    taken and is discarded. Nothing here depends on a message arriving only once, because
+    SQS makes no such promise.
+    """
+
+    name = "sqs"
+
+    def __init__(
+        self,
+        queue_name: str,
+        region: str,
+        queue_url: str = "",
+        endpoint_url: str = "",
+        access_key: str = "",
+        secret_key: str = "",
+    ) -> None:
+        import boto3
+
+        kwargs: dict = {"region_name": region}
+        if endpoint_url:
+            kwargs["endpoint_url"] = endpoint_url
+        if access_key and secret_key:
+            kwargs["aws_access_key_id"] = access_key
+            kwargs["aws_secret_access_key"] = secret_key
+
+        self.queue_name = queue_name
+        self._client = boto3.client("sqs", **kwargs)
+        # In AWS the deployment creates the queue and passes its URL in. Locally it is
+        # discovered on first use, and created if this is the very first run.
+        self._queue_url = queue_url
+
+    def _ensure_queue(self) -> str:
+        if self._queue_url:
+            return self._queue_url
+
+        from botocore.exceptions import ClientError
+
+        try:
+            self._queue_url = self._client.get_queue_url(QueueName=self.queue_name)["QueueUrl"]
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in ("AWS.SimpleQueueService.NonExistentQueue", "QueueDoesNotExist"):
+                raise
+            self._queue_url = self._client.create_queue(QueueName=self.queue_name)["QueueUrl"]
+
+        return self._queue_url
+
+    def enqueue(self, investigation_id: str) -> None:
+        self._client.send_message(QueueUrl=self._ensure_queue(), MessageBody=investigation_id)
+
+    def receive(self, db: Session, worker_id: str) -> Job | None:
+        settings = get_settings()
+
+        # WaitTimeSeconds is long polling: an empty queue blocks here rather than returning
+        # an empty response, which is what keeps an idle worker inside the free tier. It
+        # also means shutdown waits up to this long for the call to return, so it is kept
+        # shorter than the container's stop timeout.
+        response = self._client.receive_message(
+            QueueUrl=self._ensure_queue(),
+            MaxNumberOfMessages=1,
+            VisibilityTimeout=settings.queue_visibility_seconds,
+            WaitTimeSeconds=settings.queue_wait_seconds,
+        )
+
+        for message in response.get("Messages", []):
+            investigation_id = (message.get("Body") or "").strip()
+
+            if claim_job(db, investigation_id, worker_id):
+                return Job(investigation_id, _ack=lambda m=message: self._delete(m))
+
+            self._discard_duplicate(worker_id, investigation_id, message)
+
+        return None
+
+    def _delete(self, message) -> None:
+        try:
+            self._client.delete_message(
+                QueueUrl=self._ensure_queue(), ReceiptHandle=message["ReceiptHandle"]
+            )
+        except Exception:  # noqa: BLE001 - the visibility timeout will expire it anyway
+            logger.exception("could not delete queue message %s", message.get("MessageId", "?"))
 
 
 @lru_cache
@@ -258,4 +371,16 @@ def get_transport() -> Transport:
             )
         return AzureQueueTransport(settings.resolved_queue_connection, settings.queue_name)
 
-    raise ValueError(f"unknown QUEUE_BACKEND={settings.queue_backend!r} (database | azure)")
+    if settings.queue_backend == "sqs":
+        return SqsQueueTransport(
+            queue_name=settings.queue_name,
+            region=settings.resolved_sqs_region,
+            queue_url=settings.sqs_queue_url,
+            endpoint_url=settings.resolved_sqs_endpoint_url,
+            access_key=settings.resolved_sqs_access_key,
+            secret_key=settings.resolved_sqs_secret_key,
+        )
+
+    raise ValueError(
+        f"unknown QUEUE_BACKEND={settings.queue_backend!r} (database | azure | sqs)"
+    )

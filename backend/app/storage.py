@@ -2,10 +2,11 @@
 
 Two backends behind one interface:
 
-| STORAGE_BACKEND | Implementation   | Where the bytes live                       |
-|-----------------|------------------|--------------------------------------------|
-| `local`         | `LocalStorage`   | a directory on disk (development)          |
-| `azure`         | `AzureBlobStorage` | a Blob container (Azurite, or real Azure) |
+| STORAGE_BACKEND | Implementation     | Where the bytes live                          |
+|-----------------|--------------------|-----------------------------------------------|
+| `local`         | `LocalStorage`     | a directory on disk (development)             |
+| `azure`         | `AzureBlobStorage` | a Blob container (Azurite, or real Azure)     |
+| `s3`            | `S3Storage`        | an S3 bucket (MinIO, or real AWS)             |
 
 The interface is deliberately tiny so the callers - `jobs.py` and `api/investigations.py` -
 never learn which one is in use. Swapping backends is one environment variable.
@@ -114,6 +115,91 @@ class AzureBlobStorage:
             raise FileNotFoundError(key) from exc
 
 
+class S3Storage:
+    """Stores blobs in an S3 bucket.
+
+    AWS and MinIO differ only in endpoint URL and credentials, so - like the Azure pair -
+    the same code path is exercised locally and in the cloud.
+
+    In AWS no credentials are configured at all: boto3 picks up the ECS task role, so there
+    is no long-lived key anywhere in the image or the environment.
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        region: str,
+        endpoint_url: str = "",
+        access_key: str = "",
+        secret_key: str = "",
+    ) -> None:
+        import boto3
+
+        self.bucket = bucket
+        self.region = region
+
+        kwargs: dict = {"region_name": region}
+        if endpoint_url:
+            # MinIO serves bucket-in-path URLs; without this boto3 tries
+            # <bucket>.localhost, which does not resolve.
+            from botocore.config import Config
+
+            kwargs["endpoint_url"] = endpoint_url
+            kwargs["config"] = Config(s3={"addressing_style": "path"})
+        if access_key and secret_key:
+            kwargs["aws_access_key_id"] = access_key
+            kwargs["aws_secret_access_key"] = secret_key
+
+        self._client = boto3.client("s3", **kwargs)
+        self._ready = False
+
+    def _ensure_bucket(self) -> None:
+        """Create the bucket on first use, so start-up does not require S3 to be up."""
+        if self._ready:
+            return
+
+        from botocore.exceptions import ClientError
+
+        try:
+            if self.region == "us-east-1":
+                # the only region that rejects an explicit LocationConstraint
+                self._client.create_bucket(Bucket=self.bucket)
+            else:
+                self._client.create_bucket(
+                    Bucket=self.bucket,
+                    CreateBucketConfiguration={"LocationConstraint": self.region},
+                )
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                raise
+        self._ready = True
+
+    def put_file(self, key: str, src: Path) -> str:
+        self._ensure_bucket()
+        # upload_file handles multipart for large videos; put_object would buffer it all
+        self._client.upload_file(str(src), self.bucket, key)
+        return key
+
+    def put_bytes(self, key: str, data: bytes) -> str:
+        self._ensure_bucket()
+        self._client.put_object(Bucket=self.bucket, Key=key, Body=data)
+        return key
+
+    def get_bytes(self, key: str) -> bytes:
+        from botocore.exceptions import ClientError
+
+        try:
+            return self._client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "NoSuchBucket", "404"):
+                # Callers only depend on the exception *type*: the evidence endpoint turns
+                # FileNotFoundError into a 404. S3 raises its own, so translate it here.
+                raise FileNotFoundError(key) from exc
+            raise
+
+
 @lru_cache
 def get_storage() -> Storage:
     settings = get_settings()
@@ -129,6 +215,15 @@ def get_storage() -> Storage:
             )
         return AzureBlobStorage(settings.storage_connection, settings.storage_container)
 
+    if settings.storage_backend == "s3":
+        return S3Storage(
+            bucket=settings.s3_bucket,
+            region=settings.s3_region,
+            endpoint_url=settings.s3_endpoint_url,
+            access_key=settings.s3_access_key,
+            secret_key=settings.s3_secret_key,
+        )
+
     raise ValueError(
-        f"unknown STORAGE_BACKEND={settings.storage_backend!r} (local | azure)"
+        f"unknown STORAGE_BACKEND={settings.storage_backend!r} (local | azure | s3)"
     )

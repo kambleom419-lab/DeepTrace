@@ -24,7 +24,16 @@ _TMP = Path(tempfile.mkdtemp(prefix="deeptrace-tests-"))
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{(_TMP / 'test.db').as_posix()}")
 os.environ.setdefault("LOCAL_STORAGE_ROOT", str(_TMP / "storage"))
 os.environ.setdefault("STORAGE_BACKEND", "local")
-os.environ.setdefault("QUEUE_BACKEND", "database")  # set to azure to test the queue service
+os.environ.setdefault("QUEUE_BACKEND", "database")  # set to azure or sqs to test that queue
+# Forced, not defaulted: SQS long polling would block every empty receive for its full
+# duration, and the drain fixture below receives once per test, so the suite would spend
+# twenty seconds per test waiting for nothing.
+os.environ["QUEUE_WAIT_SECONDS"] = "0"
+# The other two windows normally stop a worker being handed a live job, and stop reconcile
+# re-sending a message that is merely still in flight. At 0 they mean "recover everything",
+# which is what the drain fixture needs - see its docstring.
+os.environ["QUEUE_RECONCILE_MINUTES"] = "0"
+os.environ["STALE_CLAIM_MINUTES"] = "0"
 os.environ["WORKER_IN_PROCESS"] = "false"  # tests drive worker.run_once() themselves
 os.environ["ANALYSIS_MODE"] = "fake"
 os.environ["REQUIRE_WEIGHTS"] = "false"
@@ -60,13 +69,28 @@ def sample_video() -> dict:
 
 
 @pytest.fixture(autouse=True)
-def drain_queue():
+def drain_queue(client):
     """Leave no queued rows behind, so tests never inherit each other's work.
 
     Runs the real worker function rather than a thread, which keeps the suite
     single-threaded and therefore deterministic.
+
+    Depends on `client` on purpose: that is what runs the app's lifespan and therefore
+    `init_db()`. Without the dependency, running a single file that does not otherwise
+    touch the app - `pytest tests/test_storage.py` - fails here in teardown with
+    "no such table: investigations" instead of passing.
+
+    Sweeps before receiving, and that order is load-bearing. test_worker.py claims and
+    requeues rows by calling queue.claim_next and queue.requeue_stale directly, which
+    bypasses the transport and leaves a pending row whose message was consumed long ago.
+    No receive can ever find that row, so it would survive into the next test and make
+    claim_next hand back the wrong job. The database transport hid this for the whole
+    project, because for it "drain the queue" and "find every queued row" are the same
+    operation. sweep() re-sends a message for anything still pending - production's own
+    recovery path - which makes this correct for all three transports rather than one.
     """
     yield
+    worker.sweep()
     while worker.run_once("test-drainer"):
         pass
 
