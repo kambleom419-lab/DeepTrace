@@ -135,14 +135,15 @@ backend/
 │   ├── worker.py           the claim-and-run loop; `python -m app.worker`
 │   └── api/
 │       ├── auth.py         POST /api/auth/register, /login
-│       └── investigations.py   list, upload, get, evidence image
+│       └── investigations.py   list, upload, get, evidence image, video stream
 ├── tests/
 │   ├── conftest.py         fixtures; sets test env before importing the app
 │   ├── test_contract.py    the shapes the frontend depends on
 │   ├── test_flow.py        upload -> queued -> completed -> evidence served
 │   ├── test_worker.py      claiming, contention, stale-claim recovery
 │   ├── test_queue_transport.py  all three transports, including duplicate delivery
-│   └── test_storage.py     the storage interface, backend-agnostic
+│   ├── test_storage.py     the storage interface, backend-agnostic
+│   └── test_video.py       the source-video route, including HTTP range requests
 ├── requirements.txt
 └── .env.example
 ```
@@ -321,7 +322,7 @@ cd backend
 ..\ml\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
-**40 tests, all passing — on every stack.** They cover five things:
+**48 tests, all passing — on every stack.** They cover six areas:
 
 - **`test_contract.py`** — the promise made in `frontend/src/types/index.ts`. Status codes,
   field names, that `_meta` never leaks into a result, that `progress.stage` is always one of
@@ -334,6 +335,9 @@ cd backend
   that matters: a duplicate delivery must not run the job twice.
 - **`test_storage.py`** — the storage interface, deliberately backend-agnostic so it passes
   against local files, Moto *and* Azurite.
+- **`test_video.py`** — the source-video route: bytes come back identical, the three shapes of
+  HTTP range request are honoured (`0-99`, `100-`, `-16`), an unsatisfiable range is 416 rather
+  than a crash, and one user cannot fetch another user's footage.
 
 Tests run in `ANALYSIS_MODE=fake` with a throwaway database and storage, so they need no GPU,
 no network and no model files. They set `WORKER_IN_PROCESS=false` and drive `worker.run_once()`
@@ -365,7 +369,7 @@ $env:QUEUE_BACKEND="azure"
 ..\ml\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
-The same 40 passing on all of them is the evidence that the three storage backends, the three
+The same 48 passing on all of them is the evidence that the three storage backends, the three
 queue transports and the two databases really are interchangeable — which is what makes a
 change of cloud provider a set of connection strings rather than a rewrite.
 
@@ -393,6 +397,7 @@ field to display the message.
 | POST | `/api/investigations` | Upload a video (multipart `file` + optional `title`) | 201 |
 | GET | `/api/investigations/{id}` | One investigation — **this is what the UI polls** | 200 |
 | GET | `/api/investigations/{id}/evidence/{evidenceId}` | One Grad-CAM heatmap image | 200 |
+| GET | `/api/investigations/{id}/video` | The uploaded clip, with range support so the UI can play and seek it | 200 / 206 |
 | GET | `/api/health` | Service + model-checkpoint status | 200 |
 
 ### How a request flows

@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { ArrowLeft, Download, FileJson, FileText, Loader2, Printer } from 'lucide-react'
+import { ArrowLeft, Download, FileJson, FileText, Loader2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -30,6 +30,53 @@ export default function Report() {
       .then(setInv)
       .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load'))
   }, [id])
+
+  // A forensic report without its evidence images is just a table of numbers, and the printed
+  // page is exactly where they matter most. Same authenticated-blob trick as on the Results
+  // page: the images arrive as object URLs and are released together on unmount.
+  const [heatmaps, setHeatmaps] = useState<Record<string, string>>({})
+  const objectUrls = useRef<string[]>([])
+
+  useEffect(() => {
+    const evidence = inv?.result?.evidence ?? []
+    if (evidence.length === 0) return
+    let cancelled = false
+
+    Promise.all(
+      evidence.map(async (e) => {
+        if (!e.heatmap_url) return null
+        try {
+          return [e.id, await api.fetchBlob(e.heatmap_url)] as const
+        } catch {
+          return null // one missing image must not stop the report rendering
+        }
+      }),
+    ).then((pairs) => {
+      if (cancelled) {
+        pairs.forEach((pair) => pair && URL.revokeObjectURL(pair[1]))
+        return
+      }
+      const next: Record<string, string> = {}
+      for (const pair of pairs) {
+        if (!pair) continue
+        next[pair[0]] = pair[1]
+        objectUrls.current.push(pair[1])
+      }
+      setHeatmaps(next)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [inv])
+
+  useEffect(
+    () => () => {
+      objectUrls.current.forEach((url) => URL.revokeObjectURL(url))
+      objectUrls.current = []
+    },
+    [],
+  )
 
   if (error) {
     return (
@@ -61,11 +108,15 @@ export default function Report() {
     URL.revokeObjectURL(url)
   }
 
-  const print = () => window.print()
+  // The browser's print pipeline is the only dependency-free way to produce a real PDF, and
+  // it gives selectable text and proper pagination rather than a rasterised screenshot.
+  // Chrome and Edge default the dialog's destination to "Save as PDF".
+  const exportPdf = () => window.print()
 
   return (
     <div className="mx-auto max-w-3xl space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-4">
+      {/* no-print: the controls must not appear in the exported document */}
+      <div className="no-print flex flex-wrap items-center justify-between gap-4">
         <Button variant="ghost" size="sm" asChild>
           <Link to={`/results/${id}`}>
             <ArrowLeft />
@@ -77,11 +128,11 @@ export default function Report() {
             <FileJson />
             Export JSON
           </Button>
-          <Button variant="outline" size="sm" onClick={print}>
-            <Printer />
-            Print / PDF
-          </Button>
-          <Button size="sm">
+          <Button
+            size="sm"
+            onClick={exportPdf}
+            title="Opens the print dialog — choose 'Save as PDF' as the destination"
+          >
             <Download />
             Export PDF
           </Button>
@@ -206,6 +257,13 @@ export default function Report() {
                     <p className="mt-1 font-mono text-[0.65rem] uppercase tracking-widest text-ink-faint">
                       {e.evidence_type} · frame {e.frame_number} · t={e.timestamp}s
                     </p>
+                    {heatmaps[e.id] && (
+                      <img
+                        src={heatmaps[e.id]}
+                        alt={`Grad-CAM heatmap for frame ${e.frame_number}`}
+                        className="mt-3 w-full max-w-sm rounded-sm border border-edge"
+                      />
+                    )}
                   </li>
                 ))}
               </ul>

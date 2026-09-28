@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "DeepTrace — AWS Deployment",
+    "subtitle": "Deepfake detection on ECS Fargate, ap-south-1",
+    "output": "docs/diagrams/aws-architecture.html",
+    "visual_preset": "blueprint",
+    "animation": "trace",
+    "quality_profile": "standard",
+    "views": [
+      {
+        "id": "request-path",
+        "label": "Request path",
+        "focus": ["client", "alb", "api", "sqs"],
+        "note": "Public traffic in, and the API handing the job to the queue instead of doing the work."
+      },
+      {
+        "id": "data-ownership",
+        "label": "Where the data lives",
+        "focus": ["api", "s3", "rds", "worker"],
+        "note": "Bytes in S3, rows in RDS. The queue carries only an investigation id."
+      },
+      {
+        "id": "trust-boundaries",
+        "label": "Trust boundaries",
+        "focus": ["alb", "api", "iam", "rds", "secrets"],
+        "note": "No keys exist. Each task assumes a role scoped to one bucket and one queue."
+      },
+      {
+        "id": "operations",
+        "label": "Elasticity and operations",
+        "focus": ["ecr", "cloudwatch", "worker", "sqs"],
+        "note": "Image from ECR, logs to CloudWatch, and capacity that follows the queue."
+      }
+    ]
+  },
+  "components": [
+    { "id": "client", "type": "external", "label": "Operator Browser", "sublabel": "React SPA + player", "pos": [40, 320], "size": [136, 62] },
+    { "id": "alb", "type": "security", "label": "Load Balancer", "sublabel": "public :80 · /api/health", "pos": [240, 320], "size": [160, 62] },
+    { "id": "ecr", "type": "cloud", "label": "ECR", "sublabel": "5.25 GB image", "pos": [240, 140], "size": [160, 62] },
+    { "id": "api", "type": "backend", "label": "ECS Fargate — API", "sublabel": "0.5 vCPU / 1 GB · :8000", "pos": [470, 320], "size": [156, 62] },
+    { "id": "secrets", "type": "security", "label": "Secrets Manager", "sublabel": "DB URL + JWT secret", "pos": [470, 140], "size": [156, 62] },
+    { "id": "iam", "type": "security", "label": "IAM task roles", "sublabel": "one bucket + one queue", "pos": [470, 600], "size": [156, 62] },
+    { "id": "sqs", "type": "messagebus", "label": "SQS queue", "sublabel": "deeptrace-jobs", "pos": [720, 170], "size": [156, 62] },
+    { "id": "worker", "type": "backend", "label": "Fargate — Worker", "sublabel": "1 vCPU / 4 GB · no port", "pos": [950, 170], "size": [164, 62] },
+    { "id": "s3", "type": "cloud", "label": "S3 bucket", "sublabel": "videos/ + heatmaps/", "pos": [720, 350], "size": [156, 62] },
+    { "id": "rds", "type": "database", "label": "RDS PostgreSQL", "sublabel": "db.t4g.micro · private", "pos": [720, 510], "size": [156, 62] },
+    { "id": "cloudwatch", "type": "cloud", "label": "CloudWatch", "sublabel": "logs · alarms", "pos": [950, 400], "size": [164, 62] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "AWS ap-south-1 (Mumbai) · account 838882524724", "wraps": ["alb", "api", "secrets", "iam", "sqs", "worker", "s3", "rds", "ecr", "cloudwatch"], "pad": 26 },
+    { "kind": "security-group", "label": "ALB group — :80 from the internet", "wraps": ["alb"], "pad": 10 },
+    { "kind": "security-group", "label": "tasks group — :8000 from the ALB only", "wraps": ["api"], "pad": 10 },
+    { "kind": "security-group", "label": "database group — :5432 from the tasks only", "wraps": ["rds"], "pad": 10 }
+  ],
+  "connections": [
+    { "from": "client", "to": "alb", "label": "HTTP :80", "variant": "emphasis", "route": "straight" },
+    { "from": "alb", "to": "api", "variant": "emphasis", "route": "straight", "labelAt": [430, 300] },
+    { "from": "api", "to": "sqs", "label": "enqueue id", "variant": "dashed", "route": "auto" },
+    { "from": "sqs", "to": "worker", "variant": "emphasis", "route": "straight" },
+    { "from": "api", "to": "s3", "label": "video", "route": "auto" },
+    { "from": "worker", "to": "s3", "label": "heatmaps", "variant": "dashed", "route": "auto", "labelDx": 40 },
+    { "from": "api", "to": "rds", "label": "job row", "route": "auto" },
+    { "from": "worker", "to": "rds", "label": "claim + result", "route": "auto", "labelDx": 55 },
+    { "from": "secrets", "to": "api", "label": "injected", "variant": "security", "route": "straight", "labelAt": [548, 216] },
+    { "from": "iam", "to": "api", "label": "task role", "variant": "security", "route": "straight" },
+    { "from": "ecr", "to": "api", "label": "image", "variant": "dashed", "route": "auto" },
+    { "from": "cloudwatch", "to": "worker", "label": "logs", "variant": "dashed", "route": "straight" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "The primary path", "items": ["Browser to ALB to API returns 201 in about a tenth of a second", "The API never analyses anything itself - that is the worker's job", "SQS to worker to S3 heatmaps to RDS result, and the browser polls for it"] },
+    { "dot": "emerald", "title": "State and ownership", "items": ["Rows live in RDS PostgreSQL: the source of truth", "Videos and heatmaps live in S3 as objects, never in the database", "The queue carries only an investigation id, never the video"] },
+    { "dot": "amber", "title": "Elasticity", "items": ["Worker scales 1 to 4 on SQS backlog, target 3 messages", "API scales 1 to 3 on average CPU, target 60 percent", "Both keep a floor of 1, so no cold start on the first request"] },
+    { "dot": "rose", "title": "Known gaps", "items": ["HTTP only - a trusted certificate needs a domain for ACM", "Deployment used root credentials rather than an IAM user", "5.25 GB image makes a brand-new task slow to start"] }
+  ]
+}

@@ -149,7 +149,7 @@ export default function Results() {
     if (!evidenceUrl) return
     let cancelled = false
     api
-      .fetchEvidenceImage(evidenceUrl)
+      .fetchBlob(evidenceUrl)
       .then((created) => {
         if (cancelled) {
           URL.revokeObjectURL(created)
@@ -163,6 +163,35 @@ export default function Results() {
       cancelled = true
     }
   }, [evidenceUrl])
+
+  // The source clip sits behind the same authenticated route, so it is fetched the same way
+  // and handed to a <video> as a blob URL. Declared up here with the other hooks, before the
+  // early returns below, so the hook order cannot change between the loading render and the
+  // loaded one.
+  const videoUrl = id ? api.getVideoUrl(id) : null
+  const [videoSrc, setVideoSrc] = useState<string | null>(null)
+  const [videoFailed, setVideoFailed] = useState(false)
+
+  useEffect(() => {
+    if (!videoUrl) return
+    let cancelled = false
+    api
+      .fetchBlob(videoUrl)
+      .then((created) => {
+        if (cancelled) {
+          URL.revokeObjectURL(created)
+          return
+        }
+        objectUrls.current.push(created)
+        setVideoSrc(created)
+      })
+      .catch(() => {
+        if (!cancelled) setVideoFailed(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [videoUrl])
 
   // Blob URLs live for as long as the page does, then get released all at once.
   useEffect(
@@ -230,17 +259,28 @@ export default function Results() {
             <CardDescription>{inv.video?.filename}</CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="relative aspect-video overflow-hidden rounded-md border border-edge bg-bg">
-              {/* placeholder frame — real backend serves a video stream */}
-              <div className="bg-grid flex h-full w-full items-center justify-center">
-                <span className="font-mono text-xs uppercase tracking-widest text-ink-faint">
-                  [ frame preview ]
-                </span>
-              </div>
-              <div className="absolute left-3 top-3 rounded-sm bg-black/60 px-2 py-1 font-mono text-[0.65rem] uppercase tracking-widest text-neon">
+            <div className="relative aspect-video overflow-hidden rounded-md border border-edge bg-black">
+              {videoSrc ? (
+                <video
+                  src={videoSrc}
+                  controls
+                  playsInline
+                  preload="metadata"
+                  className="h-full w-full object-contain"
+                />
+              ) : (
+                <div className="bg-grid flex h-full w-full items-center justify-center">
+                  <span className="font-mono text-xs uppercase tracking-widest text-ink-faint">
+                    {videoFailed ? '[ preview unavailable ]' : '[ loading footage ]'}
+                  </span>
+                </div>
+              )}
+              {/* pointer-events-none, or these overlays swallow clicks aimed at the
+                  player's own control bar underneath them */}
+              <div className="pointer-events-none absolute left-3 top-3 rounded-sm bg-black/60 px-2 py-1 font-mono text-[0.65rem] uppercase tracking-widest text-neon">
                 <span className="animate-blink">●</span> REC
               </div>
-              <div className="absolute bottom-3 left-3 font-mono text-[0.65rem] text-ink-dim">
+              <div className="pointer-events-none absolute right-3 top-3 rounded-sm bg-black/60 px-2 py-1 font-mono text-[0.65rem] text-ink-dim">
                 {inv.video ? `${inv.video.resolution} · ${inv.video.fps}fps` : '—'}
               </div>
             </div>

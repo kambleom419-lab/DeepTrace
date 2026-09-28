@@ -91,3 +91,77 @@ body {
 ::-webkit-scrollbar-track { background: var(--color-bg); }
 ::-webkit-scrollbar-thumb { background: var(--color-edge-2); border-radius: 5px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--color-neon-dim); }
+
+/* ── print / PDF export ──────────────────────────────────────────────────────
+   The report is built from the same design tokens as the rest of the app, so exporting is
+   mostly a matter of overriding those tokens rather than writing component-specific rules:
+   every surface goes white, every ink colour darkens, and the neon accents are dimmed to
+   something that survives a laser printer. Without this block, "Export PDF" printed the whole
+   dark application shell - sidebar, buttons and all. */
+@page {
+  margin: 14mm;
+}
+
+@media print {
+  :root {
+    --color-bg: #ffffff;
+    --color-panel: #ffffff;
+    --color-panel-2: #f6f8fa;
+    --color-edge: #d0d7de;
+    --color-edge-2: #b9c2cc;
+
+    --color-ink: #10151c;
+    --color-ink-dim: #3d4756;
+    --color-ink-faint: #6b7684;
+
+    --color-neon: #0b6b56;
+    --color-neon-dim: #0b6b56;
+    --color-cyan: #0b6ea8;
+    --color-amber: #8a5a00;
+    --color-alert: #b42318;
+    --color-ok: #067647;
+  }
+
+  html,
+  body {
+    background: #fff !important;
+  }
+
+  /* app chrome and on-screen controls have no place in a document */
+  header,
+  footer,
+  .no-print {
+    display: none !important;
+  }
+
+  main {
+    margin: 0 !important;
+    padding: 0 !important;
+    max-width: none !important;
+  }
+
+  /* decorations that would print as grey noise */
+  .scanlines::after {
+    display: none !important;
+  }
+  .bg-grid {
+    background-image: none !important;
+  }
+
+  /* the report *is* the document, so it should stop looking like a card */
+  .print-area {
+    border: none !important;
+    box-shadow: none !important;
+  }
+
+  /* keep each section, and the evidence images inside it, off a page boundary */
+  .print-area section,
+  .print-area li {
+    break-inside: avoid;
+  }
+
+  /* print the link text, not the href after it */
+  a[href]::after {
+    content: none !important;
+  }
+}

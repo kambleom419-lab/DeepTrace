@@ -12,6 +12,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     Response,
     UploadFile,
     status,
@@ -33,6 +34,45 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 FIRST_STAGE = "ingest"
+
+# What a browser will accept for playback, keyed by the uploaded file's extension. Anything
+# unrecognised is served as a generic download rather than guessed at.
+_VIDEO_TYPES = {
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+}
+
+
+def _parse_range(header: str, total: int) -> tuple[int, int] | None:
+    """Parse one `bytes=start-end` range against a known length.
+
+    Returns inclusive (start, end), or None if the range cannot be satisfied - the caller
+    answers that with 416, which is what a browser expects.
+    """
+    if not header.startswith("bytes="):
+        return None
+
+    spec = header[len("bytes=") :].split(",")[0].strip()  # only the first range
+    first, _, last = spec.partition("-")
+    try:
+        if not first:
+            # "bytes=-500" means the LAST 500 bytes, not "from 500"
+            length = int(last)
+            if length <= 0:
+                return None
+            return max(total - length, 0), total - 1
+        start = int(first)
+        end = int(last) if last else total - 1
+    except ValueError:
+        return None
+
+    if start > end or start >= total:
+        return None
+    return start, min(end, total - 1)
 
 
 def _next_investigation_id(db: Session) -> str:
@@ -97,6 +137,70 @@ def get_evidence(
     except FileNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     return Response(content=data, media_type="image/jpeg")
+
+
+@router.get("/{investigation_id}/video")
+def get_video(
+    investigation_id: str,
+    request: Request,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Serve the uploaded clip so the Results page can actually play it.
+
+    The evidence route can just answer `image/jpeg`; a video is different. Browsers ask for
+    byte ranges - Safari refuses to play at all without them, and no browser can seek - so a
+    single range is honoured here and answered with 206.
+
+    The bytes are still read whole from storage, because the Storage interface is
+    byte-oriented. That is fine for the sizes this app accepts, but a genuinely large upload
+    would be better served by a streaming accessor on that interface rather than by this
+    route reading it all into memory first.
+    """
+    inv = _owned(db, investigation_id, user)
+    if inv.video is None or not inv.video.storage_key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    try:
+        data = get_storage().get_bytes(inv.video.storage_key)
+    except FileNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    media_type = _VIDEO_TYPES.get(
+        Path(inv.video.filename).suffix.lower(), "application/octet-stream"
+    )
+    total = len(data)
+    # private: this is one user's evidence, so no shared cache should keep a copy.
+    common = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"}
+
+    header = request.headers.get("range")
+    if not header:
+        return Response(
+            content=data,
+            media_type=media_type,
+            headers={**common, "Content-Length": str(total)},
+        )
+
+    parsed = _parse_range(header, total)
+    if parsed is None:
+        # 416 tells the browser the range is unusable so it falls back to a full request
+        return Response(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            headers={**common, "Content-Range": f"bytes */{total}"},
+        )
+
+    start, end = parsed
+    chunk = data[start : end + 1]
+    return Response(
+        content=chunk,
+        status_code=status.HTTP_206_PARTIAL_CONTENT,
+        media_type=media_type,
+        headers={
+            **common,
+            "Content-Range": f"bytes {start}-{end}/{total}",
+            "Content-Length": str(len(chunk)),
+        },
+    )
 
 
 @router.post("", response_model=schemas.Investigation, status_code=status.HTTP_201_CREATED,

@@ -66,6 +66,18 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>
 }
 
+// Both the heatmaps and the source video live behind authenticated routes, and neither an
+// <img> nor a <video> tag can send an Authorization header. Fetch the bytes with the token
+// and hand the component a blob URL instead.
+async function fetchAsBlobUrl(url: string): Promise<string> {
+  const headers: Record<string, string> = {}
+  const token = getToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  const res = await fetch(url, { headers })
+  if (!res.ok) throw new ApiError(res.status, await errorMessage(res))
+  return URL.createObjectURL(await res.blob())
+}
+
 export const api = {
   login: (body: LoginRequest) =>
     request<AuthResponse>('/auth/login', { method: 'POST', body: JSON.stringify(body) }),
@@ -91,14 +103,7 @@ export const api = {
   },
   getEvidenceUrl: (investigationId: string, evidenceId: string) =>
     `${API_BASE}/investigations/${investigationId}/evidence/${evidenceId}`,
-  // The evidence route is authenticated, and an <img> tag cannot send an Authorization
-  // header. Fetch the bytes with the token and hand the component a blob URL instead.
-  fetchEvidenceImage: async (url: string): Promise<string> => {
-    const headers: Record<string, string> = {}
-    const token = getToken()
-    if (token) headers.Authorization = `Bearer ${token}`
-    const res = await fetch(url, { headers })
-    if (!res.ok) throw new ApiError(res.status, await errorMessage(res))
-    return URL.createObjectURL(await res.blob())
-  },
+  getVideoUrl: (investigationId: string) =>
+    `${API_BASE}/investigations/${investigationId}/video`,
+  fetchBlob: fetchAsBlobUrl,
 }
