@@ -5,7 +5,7 @@
     "title": "DeepTrace — Upload to Verdict",
     "subtitle": "One investigation, from the browser to a stored Grad-CAM heatmap",
     "output": "docs/diagrams/upload-sequence.html",
-    "viewBox": [1240, 960],
+    "viewBox": [1040, 960],
     "column_fit": "spread",
     "animation": "trace",
     "quality_profile": "showcase",
