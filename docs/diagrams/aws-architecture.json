@@ -7,7 +7,7 @@
     "output": "docs/diagrams/aws-architecture.html",
     "visual_preset": "blueprint",
     "animation": "trace",
-    "quality_profile": "standard",
+    "quality_profile": "showcase",
     "views": [
       {
         "id": "request-path",

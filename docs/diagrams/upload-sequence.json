@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "DeepTrace — Upload to Verdict",
+    "subtitle": "One investigation, from the browser to a stored Grad-CAM heatmap",
+    "output": "docs/diagrams/upload-sequence.html",
+    "viewBox": [1240, 960],
+    "column_fit": "spread",
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "upload", "label": "1 - Upload returns immediately", "focus": ["user", "spa", "alb", "api", "s3", "db", "q"], "note": "The API stores bytes and a row, hands the job to the queue, and answers 201 in about a tenth of a second." },
+      { "id": "worker", "label": "2 - A worker claims the job", "focus": ["wk", "q", "db", "s3"], "note": "The claim is a compare-and-swap, so a duplicate delivery finds the row taken and is discarded." },
+      { "id": "render", "label": "3 - The browser polls and renders", "focus": ["spa", "api", "s3", "db"], "note": "The heatmap is fetched with the token and rendered from a blob URL - an img tag cannot send a header." }
+    ]
+  },
+  "participants": [
+    { "id": "user", "type": "external", "label": "Operator", "sublabel": "browser" },
+    { "id": "spa", "type": "frontend", "label": "React SPA", "sublabel": "results + player" },
+    { "id": "alb", "type": "security", "label": "ALB", "sublabel": "public :80" },
+    { "id": "api", "type": "backend", "label": "FastAPI", "sublabel": "ECS Fargate" },
+    { "id": "s3", "type": "cloud", "label": "S3", "sublabel": "videos + heatmaps" },
+    { "id": "db", "type": "database", "label": "RDS Postgres", "sublabel": "source of truth" },
+    { "id": "q", "type": "messagebus", "label": "SQS", "sublabel": "deeptrace-jobs" },
+    { "id": "wk", "type": "backend", "label": "Worker", "sublabel": "Fargate, no port" }
+  ],
+  "segments": [
+    { "from": 150, "to": 365, "label": "1 - Upload (the API does not analyse anything)" },
+    { "from": 375, "to": 675, "label": "2 - A worker claims the job and runs the pipeline" },
+    { "from": 680, "to": 860, "label": "3 - The browser polls and renders" }
+  ],
+  "messages": [
+    { "id": "choose", "from": "user", "to": "spa", "y": 170, "label": "choose a video", "variant": "default" },
+    { "id": "upload", "from": "spa", "to": "alb", "y": 200, "label": "POST /api/investigations", "variant": "emphasis" },
+    { "id": "forward", "from": "alb", "to": "api", "y": 230, "label": ":8000, ALB group only", "variant": "emphasis" },
+    { "id": "put-video", "from": "api", "to": "s3", "y": 260, "label": "put videos/INV-0005/clip.mp4", "variant": "emphasis" },
+    { "id": "insert-row", "from": "api", "to": "db", "y": 290, "label": "insert row, status=queued", "variant": "emphasis" },
+    { "id": "enqueue", "from": "api", "to": "q", "y": 320, "label": "enqueue INV-0005", "variant": "dashed" },
+    { "id": "created", "from": "api", "to": "spa", "y": 350, "label": "201 Created, no result yet", "variant": "return" },
+    { "id": "poll-1", "from": "spa", "to": "api", "y": 390, "label": "poll status every 1.8 s", "variant": "default" },
+    { "id": "poll-1-back", "from": "api", "to": "spa", "y": 420, "label": "queued", "variant": "return" },
+    { "id": "receive", "from": "wk", "to": "q", "y": 450, "label": "receive, 20 s long poll", "variant": "default" },
+    { "id": "delivery", "from": "q", "to": "wk", "y": 480, "label": "INV-0005", "variant": "return" },
+    { "id": "claim", "from": "wk", "to": "db", "y": 510, "label": "claim: UPDATE ... WHERE status='queued'", "variant": "emphasis" },
+    { "id": "claimed", "from": "db", "to": "wk", "y": 540, "label": "rowcount = 1 (compare-and-swap)", "variant": "return" },
+    { "id": "get-video", "from": "wk", "to": "s3", "y": 570, "label": "get the video bytes", "variant": "default" },
+    { "id": "put-heatmaps", "from": "wk", "to": "s3", "y": 600, "label": "put heatmaps/INV-0005/*.jpg", "variant": "dashed" },
+    { "id": "save-result", "from": "wk", "to": "db", "y": 630, "label": "save verdict, scores, evidence", "variant": "emphasis" },
+    { "id": "ack", "from": "wk", "to": "q", "y": 660, "label": "delete the message", "variant": "dashed" },
+    { "id": "poll-2", "from": "spa", "to": "api", "y": 690, "label": "poll status", "variant": "default" },
+    { "id": "read-result", "from": "api", "to": "db", "y": 720, "label": "select row + result", "variant": "default" },
+    { "id": "completed", "from": "api", "to": "spa", "y": 750, "label": "completed, verdict, evidence", "variant": "return" },
+    { "id": "get-heatmap", "from": "spa", "to": "api", "y": 780, "label": "GET .../evidence/ev-001 with the token", "variant": "default" },
+    { "id": "read-heatmap", "from": "api", "to": "s3", "y": 810, "label": "get the heatmap", "variant": "default" },
+    { "id": "jpeg", "from": "api", "to": "spa", "y": 840, "label": "image/jpeg, rendered from a blob URL", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "user", "from": 165, "to": 175, "type": "external" },
+    { "participant": "spa", "from": 163, "to": 848, "type": "frontend" },
+    { "participant": "alb", "from": 195, "to": 236, "type": "security" },
+    { "participant": "api", "from": 226, "to": 356, "type": "backend" },
+    { "participant": "api", "from": 686, "to": 848, "type": "backend" },
+    { "participant": "s3", "from": 256, "to": 266, "type": "cloud" },
+    { "participant": "s3", "from": 566, "to": 606, "type": "cloud" },
+    { "participant": "s3", "from": 806, "to": 816, "type": "cloud" },
+    { "participant": "db", "from": 286, "to": 296, "type": "database" },
+    { "participant": "db", "from": 506, "to": 546, "type": "database" },
+    { "participant": "q", "from": 316, "to": 326, "type": "messagebus" },
+    { "participant": "q", "from": 446, "to": 486, "type": "messagebus" },
+    { "participant": "q", "from": 656, "to": 666, "type": "messagebus" },
+    { "participant": "wk", "from": 446, "to": 668, "type": "backend" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Why the API is fast", "items": ["It stores bytes and a row, then enqueues - no inference in the request path", "The row with status=queued IS the job record, committed before the message is sent", "A failed enqueue is logged and recovered by the worker's reconcile sweep"] },
+    { "dot": "emerald", "title": "Why duplicates are safe", "items": ["SQS standard queues are at-least-once, so redelivery is expected", "The claim is a compare-and-swap, so the second delivery finds the row taken", "Analysis is idempotent - a re-run replaces the previous result"] },
+    { "dot": "amber", "title": "Why the heatmap needs a fetch", "items": ["The evidence route is authenticated and an img tag cannot send a header", "The SPA fetches it with the token and renders a blob URL", "The same trick serves the source video, which also needs byte ranges"] }
+  ]
+}
